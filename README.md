@@ -2,7 +2,7 @@
 
 > Who is playing on your server? Collect players with `/who` and see classes, races, factions and levels at a glance.
 
-**WoW Forever only** · Interface `16001` · Version `1.0.0` · by Manuel Metzger
+**WoW Forever only** · Interface `16001` · Version `1.0.1` · by Manuel Metzger
 
 ---
 

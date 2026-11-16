@@ -19,7 +19,7 @@ local defaults = {
     filterFaction = "ALL", -- overview filter: ALL / Alliance / Horde
     filterRealm = false,   -- overview: only players of the current realm
     sortByName = false,    -- overview: class / race lists sorted by name instead of by count
-    players = {},          -- ["Name-Realm"] = record, see StorePlayer
+    players = {},          -- ["Name-Realm"] = record, see StorePlayer (only while the game runs, see SavePlayers)
 }
 
 local MAX_WHO_RESULTS = 50 -- the server never returns more players than this for one query
@@ -330,6 +330,69 @@ local function StorePlayer(p)
     p.firstSeen = old and old.firstSeen or p.seen
     db.players[key] = p
     return key, old == nil
+end
+
+-- Saving: WoW's Lua can only load about 262,000 different constants from one
+-- SavedVariables file, and one table per player needs several of them (name,
+-- key, guild, times ...). With 100,000+ players the file could not be loaded
+-- any more ("constant table overflow"). So on logout every player becomes one
+-- tab-separated line, and the lines are packed into a few large strings
+-- (db.store). On login they are unpacked into db.players again.
+local STORE_FIELDS = { "name", "realm", "level", "class", "race", "faction", "guild", "zone", "source", "seen", "firstSeen" }
+local STORE_NUMBERS = { level = true, seen = true, firstSeen = true }
+local STORE_CHUNK = 2000 -- players per saved string
+
+local function StoreValue(v)
+    if v == nil then return "" end
+    return (tostring(v):gsub("[\t\n\r]", " "))
+end
+
+local function EncodePlayers(players)
+    local store, lines, row = {}, {}, {}
+    for _, p in pairs(players) do
+        if p.name and p.realm then
+            for i, field in ipairs(STORE_FIELDS) do row[i] = StoreValue(p[field]) end
+            lines[#lines + 1] = table.concat(row, "\t")
+            if #lines >= STORE_CHUNK then
+                store[#store + 1] = table.concat(lines, "\n")
+                lines = {}
+            end
+        end
+    end
+    if #lines > 0 then store[#store + 1] = table.concat(lines, "\n") end
+    return store
+end
+
+local function DecodePlayers(store, players)
+    for _, chunk in ipairs(store) do
+        for line in chunk:gmatch("[^\n]+") do
+            local p, i = {}, 0
+            for value in (line .. "\t"):gmatch("([^\t]*)\t") do
+                i = i + 1
+                local field = STORE_FIELDS[i]
+                if field and value ~= "" then
+                    p[field] = STORE_NUMBERS[field] and tonumber(value) or value
+                end
+            end
+            if p.name and p.realm then players[p.name .. "-" .. p.realm] = p end
+        end
+    end
+end
+
+-- after login: unpack the saved strings
+local function LoadPlayers()
+    if type(db.players) ~= "table" then db.players = {} end -- older versions saved the tables directly
+    if type(db.store) == "table" then DecodePlayers(db.store, db.players) end
+    db.store = nil
+end
+
+-- on logout / reload: pack the players into strings, only the strings are saved
+local function SavePlayers()
+    if not db or type(db.players) ~= "table" then return end
+    local ok, store = pcall(EncodePlayers, db.players)
+    if ok then
+        db.store, db.storeVersion, db.players = store, 1, nil
+    end
 end
 
 local refreshQueued = false
@@ -1567,6 +1630,7 @@ f:SetScript("OnEvent", function(_, event, arg1)
         ForeverPlayerStatisticsDB = ForeverPlayerStatisticsDB or {}
         db = ForeverPlayerStatisticsDB
         CopyDefaults(defaults, db)
+        LoadPlayers()
         -- continue the pass that was running before logout / reload
         scan.queue = db.scanQueue
         -- data of the old class / race split scan, no longer used
@@ -1574,6 +1638,9 @@ f:SetScript("OnEvent", function(_, event, arg1)
         if HasOldQueries(scan.queue) then wipe(scan.queue) end -- pass saved by an older version
         scan.active = #scan.queue > 0
         f:UnregisterEvent("ADDON_LOADED")
+        f:RegisterEvent("PLAYER_LOGOUT")
+    elseif event == "PLAYER_LOGOUT" then
+        SavePlayers()
     elseif event == "PLAYER_LOGIN" then
         BuildClassLookup()
         BuildRaceLookup()

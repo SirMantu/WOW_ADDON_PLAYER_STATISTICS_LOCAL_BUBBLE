@@ -2,7 +2,7 @@
 ## Title: ForeverPlayerStatistics
 ## Notes: Collects player statistics from /who searches into a permanent database and shows class, faction, race and level overviews.
 ## Author: Manuel Metzger
-## Version: 1.0.0
+## Version: 1.0.1
 ## SavedVariables: ForeverPlayerStatisticsDB
 
 ForeverPlayerStatistics.lua
