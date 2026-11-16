@@ -4,6 +4,8 @@
 
 **WoW Forever only** · Interface `16001` · Version `1.0.1` · by Manuel Metzger
 
+📥 [Download on CurseForge](https://www.curseforge.com/wow/addons/foreverplayerstatistics) · 💻 [Source code on GitHub](https://github.com/SirMantu/WOW_ADDON_PLAYER_STATISTICS_LOCAL_BUBBLE)
+
 ---
 
 ## ✨ Features
@@ -18,7 +20,9 @@
 
 ## 📦 Installation
 
-Copy the `ForeverPlayerStatistics` folder into `_forever_/Interface/AddOns/` so that the result is `.../AddOns/ForeverPlayerStatistics/ForeverPlayerStatistics.toc`, then restart the game or type `/reload`.
+Install it with the CurseForge app from the [CurseForge project page](https://www.curseforge.com/wow/addons/foreverplayerstatistics), or download it there or from [GitHub](https://github.com/SirMantu/WOW_ADDON_PLAYER_STATISTICS_LOCAL_BUBBLE) and install it by hand:
+
+Copy the `ForeverPlayerStatistics` folder into `_forever_/Interface/AddOns/` so that the result is `.../AddOns/ForeverPlayerStatistics/ForeverPlayerStatistics.toc`, then restart the game or type `/reload`. A "Download ZIP" from GitHub unpacks to a folder named `WOW_ADDON_PLAYER_STATISTICS_LOCAL_BUBBLE-main`: rename it to `ForeverPlayerStatistics`, or the game will not load the addon.
 
 ## 🚀 How scanning works
 
