@@ -1,0 +1,8 @@
+<Bindings>
+    <Binding name="FOREVERPLAYERSTATISTICS_SCAN" header="FOREVERPLAYERSTATISTICS" category="ADDONS">
+        ForeverPlayerStatistics_ScanNext()
+    </Binding>
+    <Binding name="FOREVERPLAYERSTATISTICS_TOGGLE" category="ADDONS">
+        ForeverPlayerStatistics_Toggle()
+    </Binding>
+</Bindings>
