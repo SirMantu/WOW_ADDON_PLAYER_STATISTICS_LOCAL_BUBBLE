@@ -2,6 +2,7 @@
 
 ## 1.0.1
 
+- Fixed: error "attempted to index a table that cannot be indexed with secret keys" when targeting or mousing over players in battlegrounds (and other places where the game hides unit data from addons). Such players are now skipped instead.
 - Fixed: large databases could no longer be loaded. From roughly 50,000 players on, WoW refused the saved file with "Error loading ... ForeverPlayerStatistics.lua: constant table overflow", and the addon started with an empty database. Players are now saved packed into a few text lines, so the database loads with any realistic number of players (hundreds of millions) and the file is about a third of its old size.
 - The new format is written automatically at the next logout or `/reload`. Databases that are still small enough to load are converted without any action.
 - A database that already hit the error cannot be loaded by the game. Keep the file (with WoW closed, make a copy of `WTF/Account/<account>/SavedVariables/ForeverPlayerStatistics.lua`) before you log in again, because the next logout replaces it with the empty database. It can then be converted outside the game.

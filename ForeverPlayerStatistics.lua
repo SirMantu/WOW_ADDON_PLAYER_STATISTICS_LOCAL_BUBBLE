@@ -551,6 +551,18 @@ end
 -- Recording
 ---------------------------------------------------------------------------
 
+-- In some places (e.g. battlegrounds and instances) the game hands out
+-- "secret values" instead of real data: an addon may not compare them or use
+-- them as table keys, so those players are skipped.
+local issecretvalue = _G.issecretvalue
+local function HasSecret(...)
+    if not issecretvalue then return false end
+    for i = 1, select("#", ...) do
+        if issecretvalue((select(i, ...))) then return true end
+    end
+    return false
+end
+
 local function RecordWhoResults(forScan)
     local num, total = GetNumWho()
     num = num or 0
@@ -558,6 +570,7 @@ local function RecordWhoResults(forScan)
     local new = 0
     for i = 1, num do
         local fullName, guild, level, raceStr, classStr, zone, classFile = GetWho(i)
+        if HasSecret(fullName, guild, level, raceStr, classStr, zone, classFile) then fullName = nil end
         local name, realm = SplitName(fullName)
         if name then
             local race = ResolveRace(raceStr)
@@ -589,16 +602,20 @@ local function RecordUnit(unit)
     if not (db and db.enabled and db.recordUnits) then return end
     if not (UnitExists(unit) and UnitIsPlayer(unit)) then return end
     local name, realm = UnitName(unit)
+    if HasSecret(name, realm) then return end
     if not name or name == "" or name == UNKNOWNOBJECT then return end
     -- WoW Forever names are "First Last": the game returns the last name where
     -- the realm usually is. The player is always on your own super server.
     if realm and realm ~= "" then name = name .. " " .. realm end
     realm = MyRealm()
     local level = UnitLevel(unit)
-    if not level or level <= 0 then level = nil end
     local _, classFile = UnitClass(unit)
     local _, raceFile = UnitRace(unit)
     local faction = UnitFactionGroup(unit)
+    local guild = GetGuildInfo(unit)
+    local zone = GetRealZoneText and GetRealZoneText() or nil
+    if HasSecret(level, classFile, raceFile, faction, guild, zone) then return end
+    if not level or level <= 0 then level = nil end
     StorePlayer({
         name = name,
         realm = realm,
@@ -606,8 +623,8 @@ local function RecordUnit(unit)
         class = classFile,
         race = raceFile,
         faction = faction or RACE_FACTION[raceFile],
-        guild = GetGuildInfo(unit),
-        zone = EnglishZone(GetRealZoneText and GetRealZoneText() or nil),
+        guild = guild,
+        zone = EnglishZone(zone),
         source = "unit",
     })
     RequestRefresh()
