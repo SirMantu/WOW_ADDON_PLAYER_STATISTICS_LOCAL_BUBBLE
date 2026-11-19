@@ -110,13 +110,16 @@ end
 
 local IsComplete -- defined below, after the class and race lookups
 
+-- Counters for the statistics, kept up to date when a player is stored, so the
+-- overview and tooltip never have to go through every player (with 100,000+
+-- players that made the game stop the addon with "script ran too long").
+-- cells[realm][faction][class][raceKey][level] = number of complete players
+local cells = {}
+local completeCount = 0
+
 -- players in the database, without records that have something unknown
 local function PlayerCount()
-    local n = 0
-    for _, p in pairs(db.players) do
-        if IsComplete(p) then n = n + 1 end
-    end
-    return n
+    return completeCount
 end
 
 ---------------------------------------------------------------------------
@@ -126,28 +129,32 @@ end
 local FALLBACK_CLASSES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
 local classes = {}     -- { file = "MAGE", name = "Mage" } in game order
 local classByName = {} -- lower-case localized name -> class file
+local classSet = {}    -- class file -> true
 
 local function BuildClassLookup()
     wipe(classes)
+    wipe(classSet)
     local seen = {}
     local function add(file, name)
         if not file or seen[file] then return end
         seen[file] = true
         name = name or (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[file]) or file
         classes[#classes + 1] = { file = file, name = name }
+        classSet[file] = true
         classByName[name:lower()] = file
         local female = LOCALIZED_CLASS_NAMES_FEMALE and LOCALIZED_CLASS_NAMES_FEMALE[file]
         if female then classByName[female:lower()] = file end
     end
     if GetNumClasses and GetClassInfo then
-        for i = 1, GetNumClasses() do
+        -- class IDs have gaps in classic clients: the druid is ID 11, but
+        -- GetNumClasses() returns fewer, so every ID up to 20 is checked
+        for i = 1, math.max(GetNumClasses() or 0, 20) do
             local ok, name, file = pcall(GetClassInfo, i)
-            if ok then add(file, name) end
+            if ok and file then add(file, name) end
         end
     end
-    if #classes == 0 then
-        for _, file in ipairs(FALLBACK_CLASSES) do add(file) end
-    end
+    -- the classic classes are always known, even if the game does not list one
+    for _, file in ipairs(FALLBACK_CLASSES) do add(file) end
 end
 
 -- English class names, the same for every client language
@@ -314,10 +321,40 @@ IsComplete = function(p)
     if not p.class or not p.race or not p.level or p.level <= 0 then return false end
     if p.faction ~= "Alliance" and p.faction ~= "Horde" then return false end
     if not (RACE_FACTION[p.race] or RACE_NAMES[p.race]) then return false end
-    for _, c in ipairs(classes) do
-        if c.file == p.class then return true end
-    end
+    if classSet[p.class] then return true end
     return #classes == 0 and RAID_CLASS_COLORS ~= nil and RAID_CLASS_COLORS[p.class] ~= nil
+end
+
+-- race key used in the statistics: races on both factions (Skyborne) are counted
+-- per faction, e.g. "Skyborne:Horde"
+local function RaceKey(p)
+    local r = p.race or "?"
+    if RACE_NAMES[r] and not RACE_FACTION[r] and p.faction then r = r .. ":" .. p.faction end
+    return r
+end
+
+-- adds (d = 1) or removes (d = -1) a player in the counters
+local function CountPlayer(p, d)
+    if not p or not IsComplete(p) then return end
+    local level, realm, race = tonumber(p.level), p.realm or "?", RaceKey(p)
+    local byFaction = cells[realm]
+    if not byFaction then byFaction = {}; cells[realm] = byFaction end
+    local byClass = byFaction[p.faction]
+    if not byClass then byClass = {}; byFaction[p.faction] = byClass end
+    local byRace = byClass[p.class]
+    if not byRace then byRace = {}; byClass[p.class] = byRace end
+    local t = byRace[race]
+    if not t then t = {}; byRace[race] = t end
+    t[level] = (t[level] or 0) + d
+    if t[level] <= 0 then t[level] = nil end
+    completeCount = completeCount + d
+end
+
+-- counts every player once (after login and after the database changed as a whole)
+local function RebuildCounts()
+    wipe(cells)
+    completeCount = 0
+    for _, p in pairs(db.players) do CountPlayer(p, 1) end
 end
 
 -- Returns nil if the record is ignored because something is unknown.
@@ -328,6 +365,8 @@ local function StorePlayer(p)
     if not IsComplete(p) then return nil, false end -- keep the old record, if any
     p.seen = time()
     p.firstSeen = old and old.firstSeen or p.seen
+    CountPlayer(old, -1)
+    CountPlayer(p, 1)
     db.players[key] = p
     return key, old == nil
 end
@@ -842,14 +881,6 @@ end
 -- its players per level, and so on.
 local sel = { level = nil, class = nil, race = nil }
 
--- race key used in the statistics: races on both factions (Skyborne) are counted
--- per faction, e.g. "Skyborne:Horde"
-local function RaceKey(p)
-    local r = p.race or "?"
-    if RACE_NAMES[r] and not RACE_FACTION[r] and p.faction then r = r .. ":" .. p.faction end
-    return r
-end
-
 local function ComputeStats()
     local s = {
         total = 0, faction = {}, factionTotal = 0,
@@ -857,31 +888,38 @@ local function ComputeStats()
         level = {}, levelTotal = 0, maxLevel = 0,
     }
     local myRealm = MyRealm()
-    for _, p in pairs(db.players) do
-        -- records with an unknown class, race, faction or level are ignored
-        if IsComplete(p) and (not db.filterRealm or p.realm == myRealm) then
-            local f = p.faction or "Unknown"
-            s.faction[f] = (s.faction[f] or 0) + 1
-            s.factionTotal = s.factionTotal + 1
-            if db.filterFaction == "ALL" or p.faction == db.filterFaction then
-                local c, r, l = p.class or "?", RaceKey(p), tonumber(p.level) or 0
-                local okLevel = not sel.level or l == sel.level
-                local okClass = not sel.class or c == sel.class
-                local okRace = not sel.race or r == sel.race
-                if okLevel and okClass and okRace then s.total = s.total + 1 end
-                if okLevel and okRace then
-                    s.class[c] = (s.class[c] or 0) + 1
-                    s.classTotal = s.classTotal + 1
+    -- only complete records are counted (see CountPlayer)
+    for realm, byFaction in pairs(cells) do
+        if not db.filterRealm or realm == myRealm then
+            for f, byClass in pairs(byFaction) do
+                local showFaction = db.filterFaction == "ALL" or f == db.filterFaction
+                for c, byRace in pairs(byClass) do
+                    for r, byLevel in pairs(byRace) do
+                        for l, n in pairs(byLevel) do
+                            s.faction[f] = (s.faction[f] or 0) + n
+                            s.factionTotal = s.factionTotal + n
+                            if showFaction then
+                                local okLevel = not sel.level or l == sel.level
+                                local okClass = not sel.class or c == sel.class
+                                local okRace = not sel.race or r == sel.race
+                                if okLevel and okClass and okRace then s.total = s.total + n end
+                                if okLevel and okRace then
+                                    s.class[c] = (s.class[c] or 0) + n
+                                    s.classTotal = s.classTotal + n
+                                end
+                                if okLevel and okClass then
+                                    s.race[r] = (s.race[r] or 0) + n
+                                    s.raceTotal = s.raceTotal + n
+                                end
+                                if okClass and okRace and l > 0 then
+                                    s.level[l] = (s.level[l] or 0) + n
+                                    s.levelTotal = s.levelTotal + n
+                                end
+                                if l > s.maxLevel then s.maxLevel = l end
+                            end
+                        end
+                    end
                 end
-                if okLevel and okClass then
-                    s.race[r] = (s.race[r] or 0) + 1
-                    s.raceTotal = s.raceTotal + 1
-                end
-                if okClass and okRace and l > 0 then
-                    s.level[l] = (s.level[l] or 0) + 1
-                    s.levelTotal = s.levelTotal + 1
-                end
-                if l > s.maxLevel then s.maxLevel = l end
             end
         end
     end
@@ -1425,6 +1463,7 @@ local function CreatePanel()
         button2 = NO,
         OnAccept = function()
             wipe(db.players)
+            RebuildCounts()
             Print("database cleared.")
             RefreshPanel()
         end,
@@ -1687,6 +1726,7 @@ f:SetScript("OnEvent", function(_, event, arg1)
                 db.players[newKey] = p
             end
         end
+        RebuildCounts()
         InstallChatFilter()
         GuardWhoWindow()
         if hooksecurefunc and C_FriendList and C_FriendList.SendWho then

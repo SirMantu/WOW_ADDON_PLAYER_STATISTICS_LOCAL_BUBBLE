@@ -2,6 +2,8 @@
 
 ## 1.0.1
 
+- Fixed: druids were not recorded and were missing from the statistics. The game numbers the druid class 11 but reports fewer classes in classic clients, so the druid was treated as an unknown class.
+- Fixed: "script ran too long" error with large databases when hovering over the minimap button or while the overview was open. The statistics no longer go through every stored player each time. The addon keeps counts per realm, faction, class, race and level up to date as players are stored, so the overview and tooltip stay fast with any number of players.
 - Fixed: error "attempted to index a table that cannot be indexed with secret keys" when targeting or mousing over players in battlegrounds (and other places where the game hides unit data from addons). Such players are now skipped instead.
 - Fixed: large databases could no longer be loaded. From roughly 50,000 players on, WoW refused the saved file with "Error loading ... ForeverPlayerStatistics.lua: constant table overflow", and the addon started with an empty database. Players are now saved packed into a few text lines, so the database loads with any realistic number of players (hundreds of millions) and the file is about a third of its old size.
 - The new format is written automatically at the next logout or `/reload`. Databases that are still small enough to load are converted without any action.
