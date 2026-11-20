@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: "Only this realm" showed only about 50 players. On some logins the game returns an empty realm name. The addon then stored new players without a realm, and the filter only matched the players found since that login. Players saved without a realm were also dropped at the next `/reload` or login. The addon now remembers the last realm name and uses it when the game returns none. Players already saved without a realm are moved to that realm at the next login.
+
+- New: hover over a player name in chat to see what the database knows about that player: level, race, class, faction, guild, zone, and when the player was last and first seen. Names that are not in the database show "Not in the ForeverPlayerStatistics database yet". You can switch this off in the overview window, in Esc -> Options -> AddOns, or with `/fps chat`.
+- New: average and median level in the overview, below the players-per-level chart. They follow the faction, realm, class and race filters, so clicking a class shows its average and median level.
+- New: "Show: count / level" button in the overview. "level" switches the class and race lists to the average and median level of each class or race, sorted by average level ("Sort: name" still works). The tooltip of each row shows the number of players and the average and median level in both views.
+- New: level range bar below the players-per-level chart. Drag its handles to count only players from level X to Y: the Alliance vs Horde bar, the class and race lists with their percentages, and the average and median level then use only that range. Levels outside the range are dimmed in the chart. Right-click the bar for all levels again. The range is saved.
+
 ## 1.0.1
 
 - Fixed: druids were not recorded and were missing from the statistics. The game numbers the druid class 11 but reports fewer classes in classic clients, so the druid was treated as an unknown class.

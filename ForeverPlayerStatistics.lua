@@ -19,6 +19,9 @@ local defaults = {
     filterFaction = "ALL", -- overview filter: ALL / Alliance / Horde
     filterRealm = false,   -- overview: only players of the current realm
     sortByName = false,    -- overview: class / race lists sorted by name instead of by count
+    chatTooltip = true,    -- tooltip with the stored data when the mouse is over a player name in chat
+    listView = "count",    -- overview: class / race lists show "count" or "level" (average / median level)
+    -- rangeLo, rangeHi: level range of the overview (nil = all levels)
     players = {},          -- ["Name-Realm"] = record, see StorePlayer (only while the game runs, see SavePlayers)
 }
 
@@ -85,9 +88,24 @@ local function Pct(n, total)
     return string.format("%.1f%%", 100 * n / total)
 end
 
--- Name of the WoW Forever super server, exactly as the game shows it (e.g. "CAMWOWEU5Realm5PvE")
+-- Name of the WoW Forever super server, exactly as the game shows it (e.g. "CAMWOW EU5 Realm 5 PvE").
+-- On some logins GetRealmName() returns an empty string. Then the last known
+-- name (db.lastRealm) is used, so players are never stored without a realm.
 local function MyRealm()
-    return (GetRealmName and GetRealmName()) or (GetNormalizedRealmName and GetNormalizedRealmName()) or "?"
+    local r = GetRealmName and GetRealmName()
+    if r and r ~= "" then
+        if db then db.lastRealm = r end
+        return r
+    end
+    if db and db.lastRealm and db.lastRealm ~= "" then return db.lastRealm end
+    r = GetNormalizedRealmName and GetNormalizedRealmName()
+    if r and r ~= "" then return r end
+    return "?"
+end
+
+-- true for a realm value that was stored while the realm name was unknown
+local function BadRealm(realm)
+    return realm == nil or realm == "" or realm == "?"
 end
 
 -- Same name without spaces and dashes, the way older versions stored it
@@ -413,7 +431,11 @@ local function DecodePlayers(store, players)
                     p[field] = STORE_NUMBERS[field] and tonumber(value) or value
                 end
             end
-            if p.name and p.realm then players[p.name .. "-" .. p.realm] = p end
+            -- players saved without realm (realm name was unknown) are kept; the realm is set after login
+            if p.name then
+                p.realm = p.realm or ""
+                players[p.name .. "-" .. p.realm] = p
+            end
         end
     end
 end
@@ -881,13 +903,58 @@ end
 -- its players per level, and so on.
 local sel = { level = nil, class = nil, race = nil }
 
-local function ComputeStats()
+-- Level range of the overview (range bar below the histogram), saved in
+-- db.rangeLo / db.rangeHi. nil means "from level 1" / "up to the highest level".
+local function LevelRange()
+    return db.rangeLo or 1, db.rangeHi or math.huge
+end
+
+local function RangeActive()
+    return db.rangeLo ~= nil or db.rangeHi ~= nil
+end
+
+-- number of players, average and median level of a { [level] = count } table,
+-- only levels lo..hi are counted
+local function LevelStats(hist, lo, hi)
+    lo, hi = lo or 1, hi or math.huge
+    local n, sum, maxL = 0, 0, 0
+    for l, c in pairs(hist) do
+        if l >= lo and l <= hi and c > 0 then
+            n = n + c
+            sum = sum + l * c
+            if l > maxL then maxL = l end
+        end
+    end
+    if n == 0 then return 0 end
+    -- median: middle player (mean of the two middle players for an even count)
+    local k1, k2 = math.floor((n + 1) / 2), math.floor(n / 2) + 1
+    local acc, m1, m2 = 0, nil, nil
+    for l = math.max(lo, 1), maxL do
+        acc = acc + (hist[l] or 0)
+        if not m1 and acc >= k1 then m1 = l end
+        if acc >= k2 then m2 = l; break end
+    end
+    return n, sum / n, ((m1 or m2) + m2) / 2
+end
+
+-- "34.5" / "36" (no ".0")
+local function FmtLevel(v)
+    if not v then return "-" end
+    if v == math.floor(v) then return tostring(v) end
+    return string.format("%.1f", v)
+end
+
+-- ignoreRange: count every level (used by the minimap tooltip)
+local function ComputeStats(ignoreRange)
     local s = {
         total = 0, faction = {}, factionTotal = 0,
         class = {}, classTotal = 0, race = {}, raceTotal = 0,
         level = {}, levelTotal = 0, maxLevel = 0,
+        classLevels = {}, raceLevels = {}, -- [class or race][level] = count, for average / median
     }
     local myRealm = MyRealm()
+    local lo, hi = 1, math.huge
+    if not ignoreRange then lo, hi = LevelRange() end
     -- only complete records are counted (see CountPlayer)
     for realm, byFaction in pairs(cells) do
         if not db.filterRealm or realm == myRealm then
@@ -896,20 +963,29 @@ local function ComputeStats()
                 for c, byRace in pairs(byClass) do
                     for r, byLevel in pairs(byRace) do
                         for l, n in pairs(byLevel) do
-                            s.faction[f] = (s.faction[f] or 0) + n
-                            s.factionTotal = s.factionTotal + n
+                            local inRange = l >= lo and l <= hi
+                            if inRange then
+                                s.faction[f] = (s.faction[f] or 0) + n
+                                s.factionTotal = s.factionTotal + n
+                            end
                             if showFaction then
-                                local okLevel = not sel.level or l == sel.level
+                                local okLevel = inRange and (not sel.level or l == sel.level)
                                 local okClass = not sel.class or c == sel.class
                                 local okRace = not sel.race or r == sel.race
                                 if okLevel and okClass and okRace then s.total = s.total + n end
                                 if okLevel and okRace then
                                     s.class[c] = (s.class[c] or 0) + n
                                     s.classTotal = s.classTotal + n
+                                    local h = s.classLevels[c]
+                                    if not h then h = {}; s.classLevels[c] = h end
+                                    h[l] = (h[l] or 0) + n
                                 end
                                 if okLevel and okClass then
                                     s.race[r] = (s.race[r] or 0) + n
                                     s.raceTotal = s.raceTotal + n
+                                    local h = s.raceLevels[r]
+                                    if not h then h = {}; s.raceLevels[r] = h end
+                                    h[l] = (h[l] or 0) + n
                                 end
                                 if okClass and okRace and l > 0 then
                                     s.level[l] = (s.level[l] or 0) + n
@@ -946,12 +1022,12 @@ end
 -- Overview panel
 ---------------------------------------------------------------------------
 
-local W, H = 600, 845
+local W, H = 600, 885
 local INNER_W = W - 40
 local ROWS = 12
 local ROW_H = 16
 local ROW_BAR_W = 100
-local HIST_H = 110
+local HIST_H = 90
 
 local function CreateCheck(parent, label, x, y, get, set)
     local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
@@ -993,6 +1069,7 @@ local function CreateRows(x, y, onClick)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:AddLine(r.label)
             GameTooltip:AddLine(r.valueText, 1, 1, 1)
+            if r.levelText then GameTooltip:AddLine(r.levelText, 1, 1, 1) end
             GameTooltip:AddLine(r.selected and "Click to show all again" or "Click to filter by this", 0.6, 0.6, 0.6)
             GameTooltip:Show()
         end)
@@ -1022,10 +1099,23 @@ local function CreateRows(x, y, onClick)
     return rows
 end
 
--- nameOf(key) -> text; colorOf(key) -> r, g, b; selected = key of the selected row
-local function FillRows(rows, counts, total, nameOf, colorOf, selected)
+-- nameOf(key) -> text; colorOf(key) -> r, g, b; selected = key of the selected row;
+-- levels[key] = { [level] = count } for the average / median level
+local function FillRows(rows, counts, total, nameOf, colorOf, selected, levels)
     if selected and not counts[selected] then counts[selected] = 0 end -- keep the selection visible
     local list = Sorted(counts, nameOf)
+    for _, e in ipairs(list) do
+        local _, avg, med = LevelStats(levels[e.key] or {})
+        e.avg, e.med = avg, med
+    end
+    local levelView = db.listView == "level"
+    if levelView and not db.sortByName then
+        -- highest average level first
+        table.sort(list, function(a, b)
+            if (a.avg or 0) ~= (b.avg or 0) then return (a.avg or 0) > (b.avg or 0) end
+            return tostring(a.key) < tostring(b.key)
+        end)
+    end
     if selected then
         -- the selected row is always visible, also when the list is long
         for i, e in ipairs(list) do
@@ -1042,9 +1132,13 @@ local function FillRows(rows, counts, total, nameOf, colorOf, selected)
         local e = list[i]
         if i == ROWS and #list > ROWS then
             -- last row sums up everything that does not fit
-            local rest = 0
-            for j = ROWS, #list do rest = rest + list[j].n end
-            e = { key = false, n = rest }
+            local rest, merged = 0, {}
+            for j = ROWS, #list do
+                rest = rest + list[j].n
+                for l, c in pairs(levels[list[j].key] or {}) do merged[l] = (merged[l] or 0) + c end
+            end
+            local _, avg, med = LevelStats(merged)
+            e = { key = false, n = rest, avg = avg, med = med }
         end
         local shown = e ~= nil
         SetShown(r.name, shown); SetShown(r.bg, shown); SetShown(r.bar, shown); SetShown(r.value, shown)
@@ -1057,11 +1151,20 @@ local function FillRows(rows, counts, total, nameOf, colorOf, selected)
             if e.key then cr, cg, cb = colorOf(e.key) end
             r.label = e.key and nameOf(e.key) or "Other"
             r.valueText = Num(e.n) .. " players (" .. Pct(e.n, total) .. ")"
+            r.levelText = e.avg and ("Average level " .. FmtLevel(math.floor(e.avg * 10 + 0.5) / 10)
+                .. ", median level " .. FmtLevel(e.med)) or nil
             r.name:SetText(r.label)
             r.name:SetTextColor(cr, cg, cb)
             SetColor(r.bar, cr, cg, cb, 0.85)
-            r.bar:SetWidth(math.max(1, ROW_BAR_W * math.min(1, e.n / maxN)))
-            r.value:SetText(Num(e.n) .. "  " .. Pct(e.n, total))
+            if levelView then
+                -- bar: average level compared to the highest level
+                local frac = e.avg and e.avg / math.max(1, MaxLevel()) or 0
+                r.bar:SetWidth(math.max(1, ROW_BAR_W * math.min(1, frac)))
+                r.value:SetText(e.avg and string.format("%.1f  |cffaaaaaa%s|r", e.avg, FmtLevel(e.med)) or "-")
+            else
+                r.bar:SetWidth(math.max(1, ROW_BAR_W * math.min(1, e.n / maxN)))
+                r.value:SetText(Num(e.n) .. "  " .. Pct(e.n, total))
+            end
         end
     end
 end
@@ -1115,6 +1218,9 @@ local function RefreshHistogram(s)
     local hist = panel.hist
     local n = math.max(MaxLevel(), s.maxLevel)
     local bw = INNER_W / n
+    local rangeLo, rangeHi = LevelRange()
+    rangeHi = math.min(rangeHi, n)
+    rangeLo = math.min(rangeLo, rangeHi)
     local maxCount = 0
     for l = 1, n do maxCount = math.max(maxCount, s.level[l] or 0) end
 
@@ -1139,7 +1245,7 @@ local function RefreshHistogram(s)
                 GameTooltip:Show()
             end)
             b:SetScript("OnLeave", function(self)
-                SetColor(self.tex, self.cr, self.cg, self.cb, 0.9)
+                SetColor(self.tex, self.cr, self.cg, self.cb, self.alpha)
                 GameTooltip:Hide()
             end)
             b:SetScript("OnMouseUp", function(self)
@@ -1162,7 +1268,9 @@ local function RefreshHistogram(s)
         elseif sel.race then
             b.cr, b.cg, b.cb = RaceColor(sel.race)
         end
-        SetColor(b.tex, b.cr, b.cg, b.cb, 0.9)
+        -- levels outside the level range are dimmed
+        b.alpha = (l >= rangeLo and l <= rangeHi) and 0.9 or 0.2
+        SetColor(b.tex, b.cr, b.cg, b.cb, b.alpha)
         SetShown(b.sel, sel.level == l)
         if c > 0 then
             b.tex:SetHeight(math.max(1, HIST_H * c / maxCount))
@@ -1193,6 +1301,29 @@ local function RefreshHistogram(s)
 
     hist.maxText:SetText(maxCount > 0 and ("max " .. Num(maxCount)) or "")
 
+    -- level range bar: handles at the first and last level of the range
+    local rb = panel.rangeBar
+    rb.n, rb.bw = n, bw
+    rb.fill:ClearAllPoints()
+    rb.fill:SetPoint("TOPLEFT", rb, "TOPLEFT", (rangeLo - 1) * bw, -4)
+    rb.fill:SetSize(math.max(1, (rangeHi - rangeLo + 1) * bw), 6)
+    rb.loHandle:ClearAllPoints()
+    rb.loHandle:SetPoint("CENTER", rb, "LEFT", (rangeLo - 1) * bw, 0)
+    rb.hiHandle:ClearAllPoints()
+    rb.hiHandle:SetPoint("CENTER", rb, "LEFT", rangeHi * bw, 0)
+
+    -- average and median level of the players in the histogram (class / race / faction filter, level range)
+    local count, avg, med = LevelStats(s.level, rangeLo, rangeHi)
+    local rangeText = (rangeLo <= 1 and rangeHi >= n) and "all levels"
+        or string.format("levels |cffffffff%d - %d|r", rangeLo, rangeHi)
+    panel.rangeText:SetText("Level range: " .. rangeText .. "  |cff888888(drag; right-click: all)|r")
+    if count > 0 then
+        panel.levelInfo:SetText(string.format("Average level |cffffffff%.1f|r   Median |cffffffff%s|r   (%s players)",
+            avg, FmtLevel(med), Num(count)))
+    else
+        panel.levelInfo:SetText("no players in this range")
+    end
+
     -- level brackets in percent
     local parts = {}
     for lo = 1, n, LEVEL_STEP do
@@ -1218,12 +1349,16 @@ function RefreshPanel()
     panel.factionBtn:SetText("Faction: " .. FACTION_FILTER_LABEL[db.filterFaction])
 
     RefreshFactionBar(s)
-    FillRows(panel.classRows, s.class, s.classTotal, ClassLabel, ClassColor, sel.class)
-    FillRows(panel.raceRows, s.race, s.raceTotal, RaceLabel, RaceColor, sel.race)
+    FillRows(panel.classRows, s.class, s.classTotal, ClassLabel, ClassColor, sel.class, s.classLevels)
+    FillRows(panel.raceRows, s.race, s.raceTotal, RaceLabel, RaceColor, sel.race, s.raceLevels)
     RefreshHistogram(s)
 
     -- headers show what the lists are filtered by
     local lvl = sel.level and ("level " .. sel.level) or nil
+    if not lvl and RangeActive() then
+        local lo, hi = LevelRange()
+        lvl = hi == math.huge and ("level " .. lo .. "+") or ("levels " .. lo .. "-" .. hi)
+    end
     local function Suffix(...)
         local parts = {}
         for i = 1, select("#", ...) do
@@ -1235,7 +1370,10 @@ function RefreshPanel()
     panel.classHeader:SetText("Classes" .. Suffix(lvl, sel.race and RaceLabel(sel.race)))
     panel.raceHeader:SetText("Races" .. Suffix(lvl, sel.class and ClassLabel(sel.class)))
     panel.levelHeader:SetText("Players per level" .. Suffix(sel.class and ClassLabel(sel.class), sel.race and RaceLabel(sel.race)))
-    panel.sortBtn:SetText(db.sortByName and "Sort: name" or "Sort: count")
+    local levelView = db.listView == "level"
+    panel.sortBtn:SetText(db.sortByName and "Sort: name" or (levelView and "Sort: level" or "Sort: count"))
+    panel.viewBtn:SetText(levelView and "Show: level" or "Show: count")
+    panel.listHint:SetText(levelView and "average  |cffaaaaaamedian|r" or "")
     SetShown(panel.clearBtn, sel.level or sel.class or sel.race)
     UpdateScanUI()
 end
@@ -1345,6 +1483,22 @@ local function CreatePanel()
         db.sortByName = not db.sortByName
         RefreshPanel()
     end)
+    -- class / race lists: number of players or average / median level
+    panel.viewBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    panel.viewBtn:SetSize(100, 22)
+    panel.viewBtn:SetPoint("TOPRIGHT", -216, -62)
+    panel.viewBtn:SetScript("OnClick", function()
+        db.listView = db.listView == "level" and "count" or "level"
+        RefreshPanel()
+    end)
+    panel.viewBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Class and race lists")
+        GameTooltip:AddLine("count: number of players and share", 1, 1, 1)
+        GameTooltip:AddLine("level: average and median level", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    panel.viewBtn:SetScript("OnLeave", GameTooltip_Hide)
     -- removes the level / class / race selection
     panel.clearBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
     panel.clearBtn:SetSize(90, 22)
@@ -1380,6 +1534,8 @@ local function CreatePanel()
     -- classes and races
     panel.classHeader = Header(panel, "Classes", 20, -158)
     panel.raceHeader = Header(panel, "Races", 20 + INNER_W / 2 + 5, -158)
+    panel.listHint = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    panel.listHint:SetPoint("TOPRIGHT", -20, -160)
     panel.classRows = CreateRows(20, -178, function(key)
         sel.class = sel.class ~= key and key or nil
         RefreshPanel()
@@ -1406,13 +1562,95 @@ local function CreatePanel()
     hist.maxText:SetPoint("TOPLEFT", 4, -3)
     panel.hist = hist
 
+    -- level range bar: drag the handles to count only levels X to Y
+    local rb = CreateFrame("Frame", nil, panel)
+    rb:SetSize(INNER_W, 14)
+    rb:SetPoint("TOPLEFT", hist, "BOTTOMLEFT", 0, -18)
+    rb:EnableMouse(true)
+    rb.bg = rb:CreateTexture(nil, "BACKGROUND")
+    rb.bg:SetPoint("TOPLEFT", 0, -4)
+    rb.bg:SetSize(INNER_W, 6)
+    SetColor(rb.bg, 0, 0, 0, 0.5)
+    rb.fill = rb:CreateTexture(nil, "ARTWORK")
+    SetColor(rb.fill, 1, 0.82, 0, 0.7)
+    local function Handle()
+        local h = rb:CreateTexture(nil, "OVERLAY")
+        h:SetSize(6, 14)
+        SetColor(h, 1, 1, 1, 1)
+        return h
+    end
+    rb.loHandle, rb.hiHandle = Handle(), Handle()
+    rb.n, rb.bw = MaxLevel(), INNER_W / MaxLevel()
+
+    -- level under the mouse, as a handle position (0 .. n): lo handle = level + 1, hi handle = level
+    local function CursorPos()
+        local x = GetCursorPosition() / rb:GetEffectiveScale() - rb:GetLeft()
+        return math.max(0, math.min(rb.n, math.floor(x / rb.bw + 0.5)))
+    end
+    local function SetRange(lo, hi)
+        lo = math.max(1, math.min(lo, rb.n))
+        hi = math.max(lo, math.min(hi, rb.n))
+        local newLo = lo > 1 and lo or nil
+        local newHi = hi < rb.n and hi or nil
+        if newLo == db.rangeLo and newHi == db.rangeHi then return end
+        db.rangeLo, db.rangeHi = newLo, newHi
+        if sel.level and (sel.level < lo or sel.level > hi) then sel.level = nil end
+        RefreshPanel()
+    end
+    rb:SetScript("OnMouseDown", function(self, button)
+        if button == "RightButton" then
+            db.rangeLo, db.rangeHi = nil, nil
+            RefreshPanel()
+            return
+        end
+        -- the handle nearer to the mouse is dragged
+        local pos = CursorPos()
+        local lo, hi = LevelRange()
+        hi = math.min(hi, self.n)
+        self.dragging = math.abs(pos - (lo - 1)) <= math.abs(pos - hi) and "lo" or "hi"
+        self:SetScript("OnUpdate", function()
+            if not IsMouseButtonDown("LeftButton") then
+                self.dragging = nil
+                self:SetScript("OnUpdate", nil)
+                return
+            end
+            local p = CursorPos()
+            local curLo, curHi = LevelRange()
+            curHi = math.min(curHi, self.n)
+            if self.dragging == "lo" then
+                SetRange(math.min(p + 1, curHi), curHi)
+            else
+                SetRange(curLo, math.max(p, curLo))
+            end
+        end)
+    end)
+    rb:SetScript("OnMouseUp", function(self)
+        self.dragging = nil
+        self:SetScript("OnUpdate", nil)
+    end)
+    rb:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:AddLine("Level range")
+        GameTooltip:AddLine("Drag a handle to count only the players from level X to Y.", 1, 1, 1)
+        GameTooltip:AddLine("Factions, classes, races, average and median level use the range.", 1, 1, 1)
+        GameTooltip:AddLine("Right-click: all levels", 0.6, 0.6, 0.6)
+        GameTooltip:Show()
+    end)
+    rb:SetScript("OnLeave", GameTooltip_Hide)
+    panel.rangeBar = rb
+
+    panel.rangeText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    panel.rangeText:SetPoint("TOPLEFT", hist, "BOTTOMLEFT", 0, -36)
+    panel.levelInfo = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    panel.levelInfo:SetPoint("TOPRIGHT", hist, "BOTTOMRIGHT", 0, -36)
+
     panel.brackets = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    panel.brackets:SetPoint("TOPLEFT", hist, "BOTTOMLEFT", 0, -20)
+    panel.brackets:SetPoint("TOPLEFT", hist, "BOTTOMLEFT", 0, -54)
     panel.brackets:SetWidth(INNER_W)
     panel.brackets:SetJustifyH("LEFT")
 
     -- scanning
-    local scanTop = histTop - 20 - HIST_H - 58
+    local scanTop = histTop - 20 - HIST_H - 92
     local sep = panel:CreateTexture(nil, "ARTWORK")
     sep:SetPoint("TOPLEFT", 20, scanTop + 8)
     sep:SetSize(INNER_W, 1)
@@ -1456,6 +1694,9 @@ local function CreatePanel()
     panel.checks[#panel.checks + 1] = CreateCheck(panel, "Pause the /who search until I log out (not saved)", 14, scanTop - 170,
         function() return whoPaused end,
         function(v) ForeverPlayerStatistics_SetWhoPaused(v) end)
+    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Show the stored data when the mouse is over a player name in chat", 14, scanTop - 194,
+        function() return db.chatTooltip end,
+        function(v) ForeverPlayerStatistics_SetChatTooltip(v) end)
 
     StaticPopupDialogs["FOREVERPLAYERSTATISTICS_RESET"] = {
         text = "Delete all %s players from the ForeverPlayerStatistics database?",
@@ -1490,6 +1731,99 @@ end
 
 local function TogglePanel()
     if panel:IsShown() then panel:Hide() else panel:Show() end
+end
+
+---------------------------------------------------------------------------
+-- Tooltip on player names in chat
+--
+-- Player names in chat are links ("player:Name:lineID:chatType:..."). When the
+-- mouse is over one, the stored data of that player is shown in a tooltip.
+-- WoW Forever names are "First Last"; the game puts the last name where the
+-- realm usually is, so the link name can be "First-Last".
+---------------------------------------------------------------------------
+
+local function Ago(t)
+    local d = time() - (t or 0)
+    if d < 60 then return "just now" end
+    if d < 3600 then return math.floor(d / 60) .. " min ago" end
+    if d < 86400 then return math.floor(d / 3600) .. " h ago" end
+    local days = math.floor(d / 86400)
+    return days .. (days == 1 and " day ago" or " days ago")
+end
+
+-- link name -> stored record (or nil)
+local function FindPlayer(linkName)
+    if not (db and db.players and linkName and linkName ~= "") then return end
+    local realm = MyRealm()
+    -- "First-Last", "First Last" or "First-Last-Realm"
+    local spaced = linkName:gsub("%-", " ", 1)
+    local withoutRealm = (linkName:match("^([^%-]+%-[^%-]+)%-") or ""):gsub("%-", " ", 1)
+    for _, name in ipairs({ spaced, linkName, withoutRealm }) do
+        if name ~= "" then
+            local p = db.players[name .. "-" .. realm]
+            if p then return p end
+        end
+    end
+end
+
+local function ShowChatPlayerTooltip(frame, link)
+    if not (db and db.chatTooltip) or type(link) ~= "string" then return end
+    local kind, rest = link:match("^(%a+):(.+)$")
+    if kind ~= "player" then return end
+    local linkName = rest:match("^([^:]+)")
+    if not linkName or HasSecret(linkName) then return end
+    local p = FindPlayer(linkName)
+
+    GameTooltip:SetOwner(frame, "ANCHOR_CURSOR")
+    if not p then
+        GameTooltip:AddLine((linkName:gsub("%-", " ", 1)))
+        GameTooltip:AddLine("Not in the ForeverPlayerStatistics database yet", 0.6, 0.6, 0.6)
+        GameTooltip:Show()
+        return
+    end
+    local cr, cg, cb = ClassColor(p.class)
+    GameTooltip:AddLine(p.name, cr, cg, cb)
+    GameTooltip:AddLine(string.format("Level %s %s %s", tostring(p.level or "?"), RaceName(p.race), ClassName(p.class)), 1, 1, 1)
+    local fc = FACTION_COLORS[p.faction]
+    if fc then GameTooltip:AddLine(p.faction, fc[1], fc[2], fc[3]) end
+    if p.guild then GameTooltip:AddLine("<" .. p.guild .. ">", 0.25, 1, 0.25) end
+    if p.zone then GameTooltip:AddLine(p.zone, 1, 0.82, 0) end
+    GameTooltip:AddLine("Last seen: " .. Ago(p.seen) .. (p.source == "unit" and " (target / mouseover)" or " (/who)"), 0.7, 0.7, 0.7)
+    if p.firstSeen and p.firstSeen ~= p.seen then
+        GameTooltip:AddLine("First seen: " .. date("%Y-%m-%d", p.firstSeen), 0.7, 0.7, 0.7)
+    end
+    GameTooltip:Show()
+end
+
+local function HideChatPlayerTooltip(frame)
+    if GameTooltip:IsOwned(frame) then GameTooltip:Hide() end
+end
+
+local hookedChatFrames = {}
+local function HookChatFrame(frame)
+    if not frame or hookedChatFrames[frame] or not frame.HookScript then return end
+    hookedChatFrames[frame] = true
+    frame:HookScript("OnHyperlinkEnter", ShowChatPlayerTooltip)
+    frame:HookScript("OnHyperlinkLeave", HideChatPlayerTooltip)
+end
+
+local function HookAllChatFrames()
+    for i = 1, (NUM_CHAT_WINDOWS or 10) do HookChatFrame(_G["ChatFrame" .. i]) end
+    -- temporary windows (whispers popped out into their own tab)
+    for _, name in ipairs(CHAT_FRAMES or {}) do HookChatFrame(_G[name]) end
+end
+
+local function InstallChatTooltips()
+    HookAllChatFrames()
+    if hooksecurefunc and FCF_OpenTemporaryWindow then
+        hooksecurefunc("FCF_OpenTemporaryWindow", HookAllChatFrames)
+    end
+end
+
+function ForeverPlayerStatistics_SetChatTooltip(on)
+    db.chatTooltip = on and true or false
+    Print("tooltip on player names in chat " .. OnOff(db.chatTooltip) .. ".")
+    if RefreshPanel then RefreshPanel() end
 end
 
 ---------------------------------------------------------------------------
@@ -1557,10 +1891,15 @@ local function CreateInfoPanel()
         function(v) ForeverPlayerStatistics_SetWhoPaused(v) end)
     checks[3]:ClearAllPoints()
     checks[3]:SetPoint("TOPLEFT", checks[2], "BOTTOMLEFT", 0, -2)
+    checks[4] = CreateCheck(info, "Show the stored data when the mouse is over a player name in chat", 12, -10,
+        function() return db.chatTooltip end,
+        function(v) ForeverPlayerStatistics_SetChatTooltip(v) end)
+    checks[4]:ClearAllPoints()
+    checks[4]:SetPoint("TOPLEFT", checks[3], "BOTTOMLEFT", 0, -2)
     info:SetScript("OnShow", function()
         for _, cb in ipairs(checks) do cb:Refresh() end
     end)
-    last = checks[3]
+    last = checks[4]
 
     local open = CreateFrame("Button", nil, info, "UIPanelButtonTemplate")
     open:SetSize(160, 24)
@@ -1624,7 +1963,7 @@ local function CreateMinimapButton()
     bar:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
 
     local function ShowTooltip(self)
-        local s = ComputeStats()
+        local s = ComputeStats(true)
         local a, h = s.faction.Alliance or 0, s.faction.Horde or 0
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:AddLine("ForeverPlayerStatistics")
@@ -1700,14 +2039,30 @@ f:SetScript("OnEvent", function(_, event, arg1)
     elseif event == "PLAYER_LOGIN" then
         BuildClassLookup()
         BuildRaceLookup()
+        -- the realm name is not known on this login: take the realm most players are stored with
+        if (not GetRealmName or GetRealmName() == "") and BadRealm(db.lastRealm) then
+            local counts, best, bestN = {}, nil, 0
+            for _, p in pairs(db.players) do
+                if not BadRealm(p.realm) then
+                    local n = (counts[p.realm] or 0) + 1
+                    counts[p.realm] = n
+                    if n > bestN then best, bestN = p.realm, n end
+                end
+            end
+            db.lastRealm = best
+        end
         -- records saved with a race name that was not recognised then (e.g. Skyborne)
         local myRealm, moved = MyRealm(), {}
+        local realmKnown = not BadRealm(myRealm)
         for key, p in pairs(db.players) do
             if p.race and not RACE_NAMES[p.race] then p.race = ResolveRace(p.race) end
             p.zone = EnglishZone(p.zone) -- older records kept the German zone name
             p.realmType = nil -- no longer stored
-            if p.realm ~= myRealm and p.name then
-                if p.realm == NormalizedRealm(myRealm) then
+            if realmKnown and p.realm ~= myRealm and p.name then
+                if BadRealm(p.realm) then
+                    p.realm = myRealm -- stored while the realm name was unknown
+                    moved[key] = p
+                elseif p.realm == NormalizedRealm(myRealm) then
                     p.realm = myRealm -- older versions removed spaces and dashes
                     moved[key] = p
                 elseif p.realm and not p.realm:find("%d") then
@@ -1729,6 +2084,7 @@ f:SetScript("OnEvent", function(_, event, arg1)
         RebuildCounts()
         InstallChatFilter()
         GuardWhoWindow()
+        InstallChatTooltips()
         if hooksecurefunc and C_FriendList and C_FriendList.SendWho then
             hooksecurefunc(C_FriendList, "SendWho", OnAnySendWho)
         end
@@ -1831,8 +2187,10 @@ SlashCmdList["FOREVERPLAYERSTATISTICS"] = function(msg)
         db.deepSearch = not db.deepSearch
         Print("deep search " .. OnOff(db.deepSearch) .. ".")
         RefreshPanel()
+    elseif cmd == "chat" then
+        ForeverPlayerStatistics_SetChatTooltip(not db.chatTooltip)
     elseif cmd == "help" then
-        Print("/fps - overview  |  /fps start - start the scan / send the next query now  |  /fps stop - stop the scan  |  /fps reset - clear the database  |  /fps cooldown <seconds>  |  /fps deep - deep search on/off  |  /fps on|off - addon on/off  |  /fps who on|off - /who search on/off  |  /fps who pause|resume - pause until logout")
+        Print("/fps - overview  |  /fps start - start the scan / send the next query now  |  /fps stop - stop the scan  |  /fps reset - clear the database  |  /fps cooldown <seconds>  |  /fps deep - deep search on/off  |  /fps chat - chat name tooltip on/off  |  /fps on|off - addon on/off  |  /fps who on|off - /who search on/off  |  /fps who pause|resume - pause until logout")
         Print("Addon: " .. OnOff(db.enabled) .. "   /who search: " .. OnOff(db.whoEnabled))
         Print("Recording targets/mouseover: " .. OnOff(db.recordUnits) .. "   own /who searches: " .. OnOff(db.recordOwnWho))
     elseif panel then

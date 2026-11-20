@@ -12,6 +12,8 @@
 
 - 🔎 **Continuous server scan with `/who`**: starts automatically and asks every level from the highest down to 1 in a loop until you press Stop.
 - 👀 **Passive recording** of players you target or mouse over, including the other faction, and of your own `/who` searches.
+- 📈 **Average and median level**, overall or per class and race ("Show: level"), and a **level range bar** to see how the faction, class and race percentages change between level X and Y.
+- 💬 **Chat name tooltips**: hover over a player name in chat to see the stored level, race, class, faction, guild, zone and when the player was last seen.
 - 💾 **Permanent, account-wide database**. Each player is stored once (name + realm); scanning a player again replaces the old data.
 - 📊 **Overview window**: Alliance vs Horde, classes, races and a players-per-level chart, filterable by faction and realm. Click a level, class or race to filter the other lists by it (e.g. click level 23 to see the classes and races of level 23); sort the lists by count or by name.
 - 🗺️ **Minimap button**: left-click for the overview, right-click to start the scan or send the next query now.
@@ -51,6 +53,7 @@ Limits: only players who are online during the scan are found, and `/who` only l
 | `/fps reset` | Delete the whole database (asks first) |
 | `/fps cooldown <seconds>` | Time between two `/who` queries (default 5) |
 | `/fps deep` | Deep search on / off |
+| `/fps chat` | Tooltip on player names in chat on / off |
 | `/fps on` / `/fps off` | Switch the whole addon on / off (saved permanently) |
 | `/fps who on` / `/fps who off` | Switch the `/who` search on / off (saved permanently) |
 | `/fps who pause` / `/fps who resume` | Pause the `/who` search until you log out (not saved) |
