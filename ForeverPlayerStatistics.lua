@@ -9,6 +9,8 @@ local defaults = {
     enabled = true,        -- false: the addon records nothing and sends no /who (statistics can still be viewed)
     whoEnabled = true,     -- false: no /who scan at all; targets / mouseover are still recorded
     minimapAngle = 235,    -- degrees around the minimap
+    bgMinimapAngle = 205,  -- position of the battleground minimap button
+    bgMinimapShown = true, -- show the battleground minimap button
     recordOwnWho = true,   -- also store the results of /who searches you type yourself
     recordUnits = true,    -- store players you target or mouse over
     whoCooldown = 5,       -- seconds between two /who queries of a scan
@@ -20,6 +22,11 @@ local defaults = {
     filterRealm = false,   -- overview: only players of the current realm
     sortByName = false,    -- overview: class / race lists sorted by name instead of by count
     chatTooltip = true,    -- tooltip with the stored data when the mouse is over a player name in chat
+    chatRefresh = true,    -- hovering a name in chat queues a /who refresh of that player
+    bgTrack = true,        -- record every player at the end of each battleground (ForeverPlayerStatisticsBG)
+    bgMap = "ALL",         -- battleground window filters
+    bgBracket = "ALL",
+    bgTeam = "ALL",
     listView = "count",    -- overview: class / race lists show "count" or "level" (average / median level)
     -- rangeLo, rangeHi: level range of the overview (nil = all levels)
     players = {},          -- ["Name-Realm"] = record, see StorePlayer (only while the game runs, see SavePlayers)
@@ -42,7 +49,14 @@ local whoPaused = false
 
 local scan = { queue = {}, lastSend = 0, active = false, sent = 0, found = {}, foundCount = 0, new = 0, incomplete = 0 }
 
-local RefreshPanel, UpdateScanUI
+-- Refresh of a single player (hovering a name in chat): lookup = { name = "First Last" }
+-- is sent as /who n-"First Last" before the next scan query. lookupDone[name] =
+-- { time = time(), found = true/false } for the answers of this session.
+local lookup = nil
+local lookupDone = {}
+local LOOKUP_AGAIN = 60 -- seconds before the same player is looked up again
+
+local RefreshPanel, UpdateScanUI, RefreshChatTooltip
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -301,7 +315,7 @@ local ZONE_EN = {
     ["Blackfathom-Tiefe"] = "Blackfathom Deeps", ["Der Kral von Razorfen"] = "Razorfen Kraul",
     ["Die Hügel von Razorfen"] = "Razorfen Downs", ["Die Todesminen"] = "The Deadmines", ["Das Verlies"] = "The Stockade",
     ["Der Tempel von Atal'Hakkar"] = "The Temple of Atal'Hakkar", ["Blackrocktiefen"] = "Blackrock Depths",
-    ["Warsongschlucht"] = "Warsong Gulch", ["Arathibecken"] = "Arathi Basin",
+    ["Warsongschlucht"] = "Warsong Gulch", ["Arathibecken"] = "Arathi Basin", ["Alteractal"] = "Alterac Valley",
     -- other places
     ["Die Händlerküste"] = "The Merchant Coast", ["Die Schimmernde Ebene"] = "The Shimmering Flats",
     ["Kolkarklippe"] = "Kolkar Crag", ["Ruinen von Lordaeron"] = "Ruins of Lordaeron",
@@ -710,6 +724,7 @@ local LETTERS = {}
 for c in ("abcdefghijklmnopqrstuvwxyz"):gmatch(".") do LETTERS[#LETTERS + 1] = c end
 
 local function QueryText(q)
+    if q.name then return 'n-"' .. q.name .. '"' end -- refresh of one player
     local t = q.lo .. "-" .. q.hi
     if q.letter then t = t .. ' n-"' .. q.letter .. '"' end
     return t
@@ -718,7 +733,7 @@ end
 -- queries from older versions of the addon (level ranges, class / race / name filters)
 local function HasOldQueries(list)
     for _, q in ipairs(list) do
-        if q.hi ~= q.lo or q.class or q.race then return true end
+        if q.hi ~= q.lo or q.class or q.race or q.name then return true end
     end
     return false
 end
@@ -763,10 +778,40 @@ local function CanWho()
     return db ~= nil and db.enabled and db.whoEnabled and not whoPaused
 end
 
+-- Sends one query in the background. Must be called from a key press or click.
+local function SendQuery(q)
+    q.sent = GetTime()
+    scan.pending = q
+    scan.lastSend = q.sent
+    if not q.name then scan.sent = scan.sent + 1 end
+    SuppressWhoUI()
+    SetWhoToUi(true)
+    local ok, err = pcall(SendWhoQuery, QueryText(q))
+    if not ok then
+        scan.pending = nil
+        if q.name then
+            lookup = lookup or { name = q.name }
+        else
+            table.insert(scan.queue, 1, q)
+        end
+        RestoreWhoUI()
+        Print("|cffff4040could not send /who:|r " .. tostring(err))
+    end
+    UpdateScanUI()
+    if q.name and RefreshChatTooltip then RefreshChatTooltip() end
+end
+
 -- Sends the next query. Must be called from a key press or click.
+-- A player refresh (hovered name in chat) goes first.
 -- Sending manually also (re)starts the automatic scan.
 local function ScanNext(verbose)
     if not db then return end
+    if lookup and CanWho() and not scan.pending and CooldownLeft() == 0 then
+        local q = { name = lookup.name }
+        lookup = nil
+        SendQuery(q)
+        return
+    end
     if not CanWho() then
         if verbose then
             if not db.enabled then
@@ -799,26 +844,13 @@ local function ScanNext(verbose)
     -- deep search: a random letter of the name, so busy levels show other players each pass
     if q then q.letter = db.deepSearch and LETTERS[math.random(#LETTERS)] or nil end
     if not q then return end
-
-    q.sent = GetTime()
-    scan.pending = q
-    scan.lastSend = q.sent
-    scan.sent = scan.sent + 1
-    SuppressWhoUI()
-    SetWhoToUi(true)
-    local ok, err = pcall(SendWhoQuery, QueryText(q))
-    if not ok then
-        scan.pending = nil
-        table.insert(scan.queue, 1, q)
-        RestoreWhoUI()
-        Print("|cffff4040could not send /who:|r " .. tostring(err))
-    end
-    UpdateScanUI()
+    SendQuery(q)
 end
 
 -- Called on every key press and every click into the game world.
+-- A player refresh is sent even while the scan is stopped.
 local function AutoScanTrigger()
-    if CanWho() and db.autoScan and not scan.pending and CooldownLeft() == 0 then
+    if CanWho() and (db.autoScan or lookup) and not scan.pending and CooldownLeft() == 0 then
         ScanNext(false)
     end
 end
@@ -858,7 +890,20 @@ local function OnWhoListUpdate()
     end
     if q then lateUntil = 0 end
     if not q and not (db.enabled and db.recordOwnWho) then return end
-    local num, total = RecordWhoResults(q ~= nil)
+    local num, total = RecordWhoResults(q ~= nil and not q.name)
+    if q and q.name then
+        -- answer to a player refresh: found if the player was just stored again
+        scan.pending = nil
+        RestoreWhoUI()
+        local p = db.players[q.name .. "-" .. MyRealm()]
+        local found = p ~= nil and p.source == "who" and time() - (p.seen or 0) <= 2
+        lookupDone[q.name] = { time = time(), found = found }
+        scan.lastResult = string.format("%s: %s", QueryText(q), found and "updated" or "not online")
+        UpdateScanUI()
+        RequestRefresh()
+        if RefreshChatTooltip then RefreshChatTooltip() end
+        return
+    end
     if q then
         scan.pending = nil
         RestoreWhoUI()
@@ -880,8 +925,12 @@ local function CheckTimeout()
     local q = scan.pending
     if q and GetTime() - q.sent > WHO_TIMEOUT then
         scan.pending = nil
-        table.insert(scan.queue, 1, { lo = q.lo, hi = q.hi })
-        scan.active = true
+        if q.name then
+            lookup = lookup or { name = q.name } -- player refresh: try again (unless another player was hovered since)
+        else
+            table.insert(scan.queue, 1, { lo = q.lo, hi = q.hi })
+            scan.active = true
+        end
         WaitForLateAnswer() -- not RestoreWhoUI: a late answer would open the Who window
         scan.lastResult = "|cffff4040no answer for " .. QueryText(q) .. "|r - it will be sent again"
         UpdateScanUI()
@@ -1719,6 +1768,11 @@ local function CreatePanel()
     reset:SetScript("OnClick", function()
         StaticPopup_Show("FOREVERPLAYERSTATISTICS_RESET", Num(PlayerCount()))
     end)
+    local bgBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    bgBtn:SetSize(120, 22)
+    bgBtn:SetPoint("TOPRIGHT", -20, scanTop - 78)
+    bgBtn:SetText("Battlegrounds")
+    bgBtn:SetScript("OnClick", function() if ForeverPlayerStatistics_ToggleBG then ForeverPlayerStatistics_ToggleBG() end end)
 
     local help = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     help:SetPoint("BOTTOMLEFT", 20, 16)
@@ -1751,7 +1805,7 @@ local function Ago(t)
     return days .. (days == 1 and " day ago" or " days ago")
 end
 
--- link name -> stored record (or nil)
+-- link name -> stored record (or nil), and the "First Last" name for a /who refresh
 local function FindPlayer(linkName)
     if not (db and db.players and linkName and linkName ~= "") then return end
     local realm = MyRealm()
@@ -1761,10 +1815,27 @@ local function FindPlayer(linkName)
     for _, name in ipairs({ spaced, linkName, withoutRealm }) do
         if name ~= "" then
             local p = db.players[name .. "-" .. realm]
-            if p then return p end
+            if p then return p, p.name end
         end
     end
+    return nil, withoutRealm ~= "" and withoutRealm or spaced
 end
+
+-- Queues a /who refresh of a hovered player. Returns a reason when no refresh is possible.
+local function RequestLookup(name, p)
+    if not (db.chatRefresh and name and name ~= "") then return "off" end
+    if not CanWho() then return "nowho" end
+    local myFaction = UnitFactionGroup("player")
+    if p and p.faction and myFaction and p.faction ~= myFaction then return "faction" end
+    if scan.pending and scan.pending.name == name then return end
+    local done = lookupDone[name]
+    if done and time() - done.time < LOOKUP_AGAIN then return end
+    if p and p.source == "who" and time() - (p.seen or 0) < LOOKUP_AGAIN then return end
+    lookup = { name = name } -- replaces the refresh of a player hovered before
+end
+
+local DAY = 86400
+local hover -- { frame, link } of the name under the mouse
 
 local function ShowChatPlayerTooltip(frame, link)
     if not (db and db.chatTooltip) or type(link) ~= "string" then return end
@@ -1772,31 +1843,67 @@ local function ShowChatPlayerTooltip(frame, link)
     if kind ~= "player" then return end
     local linkName = rest:match("^([^:]+)")
     if not linkName or HasSecret(linkName) then return end
-    local p = FindPlayer(linkName)
+    local p, name = FindPlayer(linkName)
+    hover = { frame = frame, link = link }
+    local reason = RequestLookup(name, p)
 
     GameTooltip:SetOwner(frame, "ANCHOR_CURSOR")
     if not p then
-        GameTooltip:AddLine((linkName:gsub("%-", " ", 1)))
+        GameTooltip:AddLine(name or linkName)
         GameTooltip:AddLine("Not in the ForeverPlayerStatistics database yet", 0.6, 0.6, 0.6)
-        GameTooltip:Show()
-        return
+    else
+        local cr, cg, cb = ClassColor(p.class)
+        GameTooltip:AddLine(p.name, cr, cg, cb)
+        GameTooltip:AddLine(string.format("Level %s %s %s", tostring(p.level or "?"), RaceName(p.race), ClassName(p.class)), 1, 1, 1)
+        -- how old the level is; warning after one day
+        local age = time() - (p.seen or 0)
+        if age > DAY then
+            GameTooltip:AddLine("(!) Level from " .. Ago(p.seen) .. " - may be outdated", 1, 0.5, 0)
+        elseif age > 3600 then
+            GameTooltip:AddLine("Level from " .. Ago(p.seen), 1, 1, 1)
+        else
+            GameTooltip:AddLine("Level from " .. Ago(p.seen), 0.25, 1, 0.25)
+        end
+        local fc = FACTION_COLORS[p.faction]
+        if fc then GameTooltip:AddLine(p.faction, fc[1], fc[2], fc[3]) end
+        if p.guild then GameTooltip:AddLine("<" .. p.guild .. ">", 0.25, 1, 0.25) end
+        if p.zone then GameTooltip:AddLine(p.zone, 1, 0.82, 0) end
+        GameTooltip:AddLine("Source: " .. (p.source == "unit" and "target / mouseover" or "/who"), 0.7, 0.7, 0.7)
+        if p.firstSeen and p.firstSeen ~= p.seen then
+            GameTooltip:AddLine("First seen: " .. date("%Y-%m-%d", p.firstSeen), 0.7, 0.7, 0.7)
+        end
     end
-    local cr, cg, cb = ClassColor(p.class)
-    GameTooltip:AddLine(p.name, cr, cg, cb)
-    GameTooltip:AddLine(string.format("Level %s %s %s", tostring(p.level or "?"), RaceName(p.race), ClassName(p.class)), 1, 1, 1)
-    local fc = FACTION_COLORS[p.faction]
-    if fc then GameTooltip:AddLine(p.faction, fc[1], fc[2], fc[3]) end
-    if p.guild then GameTooltip:AddLine("<" .. p.guild .. ">", 0.25, 1, 0.25) end
-    if p.zone then GameTooltip:AddLine(p.zone, 1, 0.82, 0) end
-    GameTooltip:AddLine("Last seen: " .. Ago(p.seen) .. (p.source == "unit" and " (target / mouseover)" or " (/who)"), 0.7, 0.7, 0.7)
-    if p.firstSeen and p.firstSeen ~= p.seen then
-        GameTooltip:AddLine("First seen: " .. date("%Y-%m-%d", p.firstSeen), 0.7, 0.7, 0.7)
+
+    -- state of the /who refresh of this player
+    local done = lookupDone[name]
+    if scan.pending and scan.pending.name == name then
+        GameTooltip:AddLine("Refreshing...", 0.4, 0.8, 1)
+    elseif lookup and lookup.name == name then
+        local wait = CooldownLeft()
+        GameTooltip:AddLine(wait > 0 and string.format("Refresh in %d s, with your next key press or click", math.ceil(wait))
+            or "Refresh with your next key press or click", 0.4, 0.8, 1)
+    elseif done then
+        if done.found then
+            GameTooltip:AddLine("Refreshed " .. Ago(done.time), 0.4, 0.8, 1)
+        else
+            GameTooltip:AddLine("Not online (checked " .. Ago(done.time) .. ")", 0.6, 0.6, 0.6)
+        end
+    elseif reason == "faction" then
+        GameTooltip:AddLine("Other faction: /who cannot refresh this player", 0.6, 0.6, 0.6)
     end
     GameTooltip:Show()
 end
 
 local function HideChatPlayerTooltip(frame)
+    hover = nil
     if GameTooltip:IsOwned(frame) then GameTooltip:Hide() end
+end
+
+-- shows the tooltip again when the refresh of the hovered player was sent or answered
+function RefreshChatTooltip()
+    if hover and GameTooltip:IsOwned(hover.frame) then
+        ShowChatPlayerTooltip(hover.frame, hover.link)
+    end
 end
 
 local hookedChatFrames = {}
@@ -1820,10 +1927,819 @@ local function InstallChatTooltips()
     end
 end
 
+function ForeverPlayerStatistics_SetChatRefresh(on)
+    db.chatRefresh = on and true or false
+    if not db.chatRefresh then lookup = nil end
+    Print("/who refresh when hovering a player name in chat " .. OnOff(db.chatRefresh) .. ".")
+    if RefreshPanel then RefreshPanel() end
+end
+
 function ForeverPlayerStatistics_SetChatTooltip(on)
     db.chatTooltip = on and true or false
     Print("tooltip on player names in chat " .. OnOff(db.chatTooltip) .. ".")
     if RefreshPanel then RefreshPanel() end
+end
+
+---------------------------------------------------------------------------
+-- Battleground tracker
+--
+-- At the end of every battleground (as soon as the game knows the winner) all
+-- players of the scoreboard are stored in ForeverPlayerStatisticsBG, one entry
+-- per match. The scoreboard has no levels: they are collected during the match
+-- from the raid, nameplates, target and mouseover, otherwise taken from the
+-- player database. Each match is saved packed into one string (see SavePlayers
+-- for why).
+---------------------------------------------------------------------------
+
+local bgdb -- ForeverPlayerStatisticsBG = { version = 1, matches = { { time, map, winner, me, myLevel, realm, dur, p } } }
+local bg = { active = false, match = nil, levels = {}, lastRequest = 0, warned = false }
+local bgCache   -- parsed matches, rebuilt when a match is added or the data is reset
+local bgPanel
+local bgSel = { level = nil, class = nil, race = nil }
+local RefreshBGPanel, UpdateBGIcon
+
+local BG_FIELDS = { "name", "faction", "class", "race", "level", "kb", "hk", "deaths", "honor", "damage", "healing" }
+local BG_NUMBERS = { level = true, kb = true, hk = true, deaths = true, honor = true, damage = true, healing = true }
+
+local function InBattleground()
+    local inInstance, kind = IsInInstance()
+    return inInstance and kind == "pvp"
+end
+
+-- scoreboard / raid name -> "First Last" (WoW Forever names, without a realm suffix)
+local function BGName(n)
+    if not n or n == "" then return nil end
+    if n:find(" ") then return (n:gsub("%-.*$", "")) end -- "First Last-Realm"
+    n = n:match("^([^%-]+%-[^%-]+)%-") or n               -- "First-Last-Realm"
+    return (n:gsub("%-", " ", 1))                          -- "First-Last"
+end
+
+local function NoteLevel(name, level)
+    if name and type(level) == "number" and level > 0 then bg.levels[name] = level end
+end
+
+local function NoteUnitLevel(unit)
+    if not bg.active or not UnitExists(unit) or not UnitIsPlayer(unit) then return end
+    local name, realm = UnitName(unit)
+    local level = UnitLevel(unit)
+    if HasSecret(name, realm, level) or not name then return end
+    if realm and realm ~= "" then name = name .. " " .. realm end -- last name in the realm slot
+    NoteLevel(name, level)
+end
+
+local function NoteRosterLevels()
+    if not bg.active or not GetRaidRosterInfo then return end
+    for i = 1, (GetNumGroupMembers and GetNumGroupMembers() or 0) do
+        local ok, name, _, _, level = pcall(GetRaidRosterInfo, i)
+        if ok and not HasSecret(name, level) then NoteLevel(BGName(name), level) end
+    end
+end
+
+-- name, faction (0 Horde / 1 Alliance), race, class, classToken, kb, hk, deaths, honor, damage, healing
+local function ReadScore(i)
+    if C_PvP and C_PvP.GetScoreInfo then
+        local ok, info = pcall(C_PvP.GetScoreInfo, i)
+        if ok and type(info) == "table" and info.name then
+            return info.name, info.faction, info.raceName, info.className, info.classToken,
+                info.killingBlows, info.honorableKills, info.deaths, info.honorGained, info.damageDone, info.healingDone
+        end
+    end
+    if not GetBattlefieldScore then return end
+    local r = { GetBattlefieldScore(i) }
+    -- the position of race / class differs between client versions: find the class token
+    for j = 7, #r do
+        if type(r[j]) == "string" and classSet[r[j]] then
+            return r[1], r[6], r[j - 2], r[j - 1], r[j], r[2], r[3], r[4], r[5], r[j + 1], r[j + 2]
+        end
+    end
+    return r[1], r[6], r[8], r[9], r[10], r[2], r[3], r[4], r[5], r[11], r[12]
+end
+
+local function RecordMatch()
+    if not (db and bgdb and db.enabled and db.bgTrack) then return end
+    local winnerId = GetBattlefieldWinner and GetBattlefieldWinner()
+    if winnerId == nil or HasSecret(winnerId) then return end
+    local winner = (winnerId == 0 and "Horde") or (winnerId == 1 and "Alliance") or "Draw"
+    local n = GetNumBattlefieldScores and GetNumBattlefieldScores() or 0
+    if n == 0 then return end
+    NoteRosterLevels()
+    local realm = MyRealm()
+    local lines, row, skipped = {}, {}, 0
+    for i = 1, n do
+        local name, faction, race, class, token, kb, hk, deaths, honor, damage, healing = ReadScore(i)
+        if HasSecret(name, faction, race, class, token, kb, hk, deaths, honor, damage, healing) then
+            skipped = skipped + 1
+        else
+            name = BGName(name)
+            local raceFile = ResolveRace(race)
+            local f = (faction == 0 and "Horde") or (faction == 1 and "Alliance") or RACE_FACTION[raceFile]
+            local cls = (token and classSet[token]) and token or (class and classByName[class:lower()])
+            if name and f and cls and raceFile then
+                local stored = db.players[name .. "-" .. realm]
+                local p = {
+                    name = name, faction = f, class = cls, race = raceFile,
+                    level = bg.levels[name] or (stored and stored.level),
+                    kb = kb, hk = hk, deaths = deaths, honor = honor, damage = damage, healing = healing,
+                }
+                for k, field in ipairs(BG_FIELDS) do row[k] = StoreValue(p[field]) end
+                lines[#lines + 1] = table.concat(row, "\t")
+            else
+                skipped = skipped + 1
+            end
+        end
+    end
+    if #lines == 0 then
+        if not bg.warned then
+            bg.warned = true
+            Print("|cffff4040battleground not recorded:|r the game does not give addons the scoreboard data here.")
+        end
+        return
+    end
+    -- the scoreboard is updated a few more times after the end: the same entry is replaced
+    local m = bg.match
+    local isNew = m == nil
+    if isNew then
+        m = { time = time() }
+        bgdb.matches[#bgdb.matches + 1] = m
+        bg.match = m
+    end
+    m.map = EnglishZone(GetRealZoneText and GetRealZoneText() or nil) or "?"
+    m.winner = winner
+    m.me = UnitFactionGroup("player")
+    m.myLevel = UnitLevel("player")
+    m.realm = realm
+    if GetBattlefieldInstanceRunTime then
+        local ok, ms = pcall(GetBattlefieldInstanceRunTime)
+        if ok and type(ms) == "number" and ms > 0 then m.dur = math.floor(ms / 1000) end
+    end
+    m.p = table.concat(lines, "\n")
+    bgCache = nil
+    if isNew then
+        local result = winner == "Draw" and "draw" or (winner == m.me and "|cff00ff00won|r" or "|cffff4040lost|r")
+        Print(string.format("battleground recorded: %s, %s, %d players. %d battlegrounds in the database.",
+            m.map, result, #lines, #bgdb.matches))
+    end
+    if RefreshBGPanel then RefreshBGPanel() end
+    if UpdateBGIcon then UpdateBGIcon() end
+end
+
+-- entering / leaving a battleground starts a new match
+local function BG_CheckZone()
+    local now = InBattleground()
+    if now ~= bg.active then
+        bg.active = now
+        bg.match = nil
+        bg.warned = false
+        wipe(bg.levels)
+        if now and RequestBattlefieldScoreData then RequestBattlefieldScoreData() end
+    end
+end
+
+-- every 15 s in a battleground: fresh scoreboard data, the end is caught by UPDATE_BATTLEFIELD_SCORE
+local function BG_Tick()
+    if bg.active and RequestBattlefieldScoreData and GetTime() - bg.lastRequest > 15 then
+        bg.lastRequest = GetTime()
+        RequestBattlefieldScoreData()
+    end
+end
+
+local function BG_OnScore()
+    if bg.active then RecordMatch() end
+end
+
+local function ParseMatches()
+    if bgCache then return bgCache end
+    bgCache = {}
+    for _, m in ipairs(bgdb.matches) do
+        local players = {}
+        for line in (m.p or ""):gmatch("[^\n]+") do
+            local p, i = {}, 0
+            for value in (line .. "\t"):gmatch("([^\t]*)\t") do
+                i = i + 1
+                local field = BG_FIELDS[i]
+                if field and value ~= "" then p[field] = BG_NUMBERS[field] and tonumber(value) or value end
+            end
+            if p.name then players[#players + 1] = p end
+        end
+        bgCache[#bgCache + 1] = { m = m, players = players }
+    end
+    return bgCache
+end
+
+-- bracket of a match from your own level: "10-19", "20-29", ..., "60"
+local function Bracket(level)
+    level = tonumber(level)
+    if not level or level <= 0 then return "?" end
+    local max = MaxLevel()
+    if level >= max then return tostring(max) end
+    local lo = math.floor(level / 10) * 10
+    return lo .. "-" .. math.min(lo + 9, max - 1)
+end
+
+local function AddWin(t, key, win)
+    local e = t[key]
+    if not e then e = { g = 0, w = 0 }; t[key] = e end
+    e.g = e.g + 1
+    if win then e.w = e.w + 1 end
+end
+
+-- per battleground: matches, wins per faction, your record and the win rate of
+-- the player games that match the team / class / race / level filters
+local function AddMapMatch(ms, pm)
+    local m = pm.m
+    ms.matches = ms.matches + 1
+    ms.wins[m.winner] = (ms.wins[m.winner] or 0) + 1
+    if m.winner == m.me then
+        ms.myWin = ms.myWin + 1
+    elseif m.winner ~= "Draw" then
+        ms.myLoss = ms.myLoss + 1
+    end
+    if m.winner == "Draw" then return end
+    for _, p in ipairs(pm.players) do
+        if (db.bgTeam == "ALL" or p.faction == db.bgTeam)
+            and (not bgSel.level or p.level == bgSel.level)
+            and (not bgSel.class or p.class == bgSel.class)
+            and (not bgSel.race or RaceKey(p) == bgSel.race) then
+            ms.g = ms.g + 1
+            if p.faction == m.winner then ms.w = ms.w + 1 end
+        end
+    end
+end
+
+local function NewMapStats()
+    return { matches = 0, wins = { Alliance = 0, Horde = 0, Draw = 0 }, myWin = 0, myLoss = 0, g = 0, w = 0 }
+end
+
+local function ComputeBGStats()
+    local s = {
+        matches = 0, wins = { Alliance = 0, Horde = 0, Draw = 0 }, myWin = 0, myLoss = 0,
+        entries = 0, noLevel = 0, class = {}, race = {}, level = {}, maps = {}, brackets = {},
+        mapStats = { ALL = NewMapStats() }, -- ["Warsong Gulch"] = ..., ALL = all battlegrounds
+    }
+    for _, pm in ipairs(ParseMatches()) do
+        local m = pm.m
+        local bracket = Bracket(m.myLevel)
+        s.maps[m.map or "?"] = true
+        s.brackets[bracket] = true
+        -- battleground list: every map, only the bracket filter applies
+        if db.bgBracket == "ALL" or bracket == db.bgBracket then
+            local map = m.map or "?"
+            s.mapStats[map] = s.mapStats[map] or NewMapStats()
+            AddMapMatch(s.mapStats[map], pm)
+            AddMapMatch(s.mapStats.ALL, pm)
+        end
+        if (db.bgMap == "ALL" or m.map == db.bgMap) and (db.bgBracket == "ALL" or bracket == db.bgBracket) then
+            s.matches = s.matches + 1
+            s.wins[m.winner] = (s.wins[m.winner] or 0) + 1
+            if m.winner == m.me then
+                s.myWin = s.myWin + 1
+            elseif m.winner ~= "Draw" then
+                s.myLoss = s.myLoss + 1
+            end
+            if m.winner ~= "Draw" then -- draws do not count for the win rates
+                for _, p in ipairs(pm.players) do
+                    if db.bgTeam == "ALL" or p.faction == db.bgTeam then
+                        local win = p.faction == m.winner
+                        local race = RaceKey(p)
+                        local okLevel = not bgSel.level or p.level == bgSel.level
+                        local okClass = not bgSel.class or p.class == bgSel.class
+                        local okRace = not bgSel.race or race == bgSel.race
+                        if okLevel and okClass and okRace then
+                            s.entries = s.entries + 1
+                            if not p.level then s.noLevel = s.noLevel + 1 end
+                        end
+                        if okLevel and okRace then AddWin(s.class, p.class, win) end
+                        if okLevel and okClass then AddWin(s.race, race, win) end
+                        if okClass and okRace and p.level then AddWin(s.level, p.level, win) end
+                    end
+                end
+            end
+        end
+    end
+    return s
+end
+
+local function Rate(e)
+    return (e and e.g > 0) and e.w / e.g or 0
+end
+
+local function RateColor(rate)
+    if rate >= 0.5 then return 0.25, 0.85, 0.25 end
+    return 0.9, 0.25, 0.25
+end
+
+-- class / race list with win rates; the 50 % mark is shown on every bar
+local function CreateWinRows(parent, x, y, onClick)
+    local rows = {}
+    for i = 1, ROWS do
+        local ry = y - (i - 1) * ROW_H
+        local r = {}
+        r.btn = CreateFrame("Button", nil, parent)
+        r.btn:SetPoint("TOPLEFT", x - 2, ry + 2)
+        r.btn:SetSize(INNER_W / 2 - 5, ROW_H)
+        r.sel = r.btn:CreateTexture(nil, "BACKGROUND")
+        r.sel:SetAllPoints()
+        SetColor(r.sel, 1, 0.82, 0, 0.25)
+        r.hl = r.btn:CreateTexture(nil, "HIGHLIGHT")
+        r.hl:SetAllPoints()
+        SetColor(r.hl, 1, 1, 1, 0.08)
+        r.btn:SetScript("OnClick", function() if r.key then onClick(r.key) end end)
+        r.btn:SetScript("OnEnter", function(self)
+            if not r.key then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(r.label)
+            GameTooltip:AddLine(r.tip, 1, 1, 1)
+            GameTooltip:AddLine(r.selected and "Click to show all again" or "Click to filter by this", 0.6, 0.6, 0.6)
+            GameTooltip:Show()
+        end)
+        r.btn:SetScript("OnLeave", GameTooltip_Hide)
+        r.name = parent:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+        r.name:SetPoint("TOPLEFT", x, ry)
+        r.name:SetSize(90, ROW_H)
+        r.name:SetJustifyH("LEFT")
+        r.name:SetJustifyV("TOP")
+        if r.name.SetWordWrap then r.name:SetWordWrap(false) end
+        r.bg = parent:CreateTexture(nil, "BORDER")
+        r.bg:SetPoint("TOPLEFT", x + 95, ry)
+        r.bg:SetSize(ROW_BAR_W, 11)
+        SetColor(r.bg, 0, 0, 0, 0.4)
+        r.bar = parent:CreateTexture(nil, "ARTWORK")
+        r.bar:SetPoint("TOPLEFT", x + 95, ry)
+        r.bar:SetHeight(11)
+        r.mid = parent:CreateTexture(nil, "OVERLAY")
+        r.mid:SetPoint("TOPLEFT", x + 95 + ROW_BAR_W / 2, ry + 1)
+        r.mid:SetSize(1, 13)
+        SetColor(r.mid, 1, 1, 1, 0.6)
+        r.value = parent:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+        r.value:SetPoint("TOPLEFT", x + 200, ry)
+        r.value:SetSize(75, ROW_H)
+        r.value:SetJustifyH("RIGHT")
+        r.value:SetJustifyV("TOP")
+        if r.value.SetWordWrap then r.value:SetWordWrap(false) end
+        rows[i] = r
+    end
+    return rows
+end
+
+local function FillWinRows(rows, stats, nameOf, colorOf, selected)
+    local list = {}
+    for k, e in pairs(stats) do list[#list + 1] = { key = k, g = e.g, w = e.w, rate = Rate(e) } end
+    if selected and not stats[selected] then list[#list + 1] = { key = selected, g = 0, w = 0, rate = 0 } end
+    table.sort(list, function(a, b)
+        if db.sortByName then
+            local na, nb = nameOf(a.key), nameOf(b.key)
+            if na ~= nb then return na < nb end
+        elseif a.rate ~= b.rate then
+            return a.rate > b.rate
+        end
+        return tostring(a.key) < tostring(b.key)
+    end)
+    if selected then
+        for i, e in ipairs(list) do
+            if e.key == selected and i > ROWS then
+                table.remove(list, i)
+                table.insert(list, 1, e)
+                break
+            end
+        end
+    end
+    for i, r in ipairs(rows) do
+        local e = list[i]
+        local shown = e ~= nil
+        for _, part in ipairs({ r.name, r.bg, r.bar, r.mid, r.value, r.btn }) do SetShown(part, shown) end
+        r.key = e and e.key or nil
+        r.selected = e and e.key == selected
+        SetShown(r.sel, r.selected)
+        if e then
+            local cr, cg, cb = colorOf(e.key)
+            r.label = nameOf(e.key)
+            r.tip = string.format("%s of %s games won (%s)", Num(e.w), Num(e.g), Pct(e.w, e.g))
+            r.name:SetText(r.label)
+            r.name:SetTextColor(cr, cg, cb)
+            SetColor(r.bar, cr, cg, cb, 0.85)
+            r.bar:SetWidth(math.max(1, ROW_BAR_W * e.rate))
+            local rr, rg, rb = RateColor(e.rate)
+            r.value:SetText(string.format("|cff%02x%02x%02x%s|r  %s", rr * 255, rg * 255, rb * 255, Pct(e.w, e.g), Num(e.g)))
+        end
+    end
+end
+
+local BG_H = 785
+local BG_HIST_H = 100
+local MAP_ROWS = 6 -- "All battlegrounds" + up to 5 maps
+
+-- battleground list: one row per map, click filters the whole window by it
+local function CreateMapRows(parent, y)
+    local rows = {}
+    for i = 1, MAP_ROWS do
+        local ry = y - (i - 1) * ROW_H
+        local r = {}
+        r.btn = CreateFrame("Button", nil, parent)
+        r.btn:SetPoint("TOPLEFT", 18, ry + 2)
+        r.btn:SetSize(INNER_W + 4, ROW_H)
+        r.sel = r.btn:CreateTexture(nil, "BACKGROUND")
+        r.sel:SetAllPoints()
+        SetColor(r.sel, 1, 0.82, 0, 0.25)
+        r.hl = r.btn:CreateTexture(nil, "HIGHLIGHT")
+        r.hl:SetAllPoints()
+        SetColor(r.hl, 1, 1, 1, 0.08)
+        r.btn:SetScript("OnClick", function()
+            if not r.key then return end
+            db.bgMap = (r.key == "ALL" or db.bgMap == r.key) and "ALL" or r.key
+            RefreshBGPanel()
+        end)
+        r.btn:SetScript("OnEnter", function(self)
+            if not r.key then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(r.label)
+            for _, line in ipairs(r.tips) do GameTooltip:AddLine(line, 1, 1, 1) end
+            GameTooltip:AddLine(r.key == "ALL" and "Click to show all battlegrounds"
+                or (r.selected and "Click to show all battlegrounds again" or "Click to show only this battleground"), 0.6, 0.6, 0.6)
+            GameTooltip:Show()
+        end)
+        r.btn:SetScript("OnLeave", GameTooltip_Hide)
+        local function Text(x, w, justify)
+            local fs = parent:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+            fs:SetPoint("TOPLEFT", x, ry)
+            fs:SetSize(w, ROW_H)
+            fs:SetJustifyH(justify)
+            fs:SetJustifyV("TOP")
+            if fs.SetWordWrap then fs:SetWordWrap(false) end
+            return fs
+        end
+        r.name = Text(20, 140, "LEFT")
+        r.matches = Text(160, 50, "RIGHT")
+        r.a = parent:CreateTexture(nil, "ARTWORK")
+        r.a:SetPoint("TOPLEFT", 222, ry)
+        r.a:SetHeight(11)
+        SetColor(r.a, FACTION_COLORS.Alliance[1], FACTION_COLORS.Alliance[2], FACTION_COLORS.Alliance[3], 0.85)
+        r.h = parent:CreateTexture(nil, "ARTWORK")
+        r.h:SetPoint("TOPRIGHT", parent, "TOPLEFT", 222 + 120, ry)
+        r.h:SetHeight(11)
+        SetColor(r.h, FACTION_COLORS.Horde[1], FACTION_COLORS.Horde[2], FACTION_COLORS.Horde[3], 0.85)
+        r.factionText = Text(222, 120, "CENTER")
+        r.record = Text(350, 110, "RIGHT")
+        r.rate = Text(470, 90, "RIGHT")
+        rows[i] = r
+    end
+    return rows
+end
+
+local function FillMapRows(rows, mapStats)
+    local list = { "ALL" }
+    local maps = {}
+    for map in pairs(mapStats) do if map ~= "ALL" then maps[#maps + 1] = map end end
+    table.sort(maps)
+    for _, map in ipairs(maps) do list[#list + 1] = map end
+    for i, r in ipairs(rows) do
+        local key = list[i]
+        local ms = key and mapStats[key]
+        local shown = ms ~= nil
+        for _, part in ipairs({ r.btn, r.name, r.matches, r.a, r.h, r.factionText, r.record, r.rate }) do SetShown(part, shown) end
+        r.key = key
+        r.selected = key and (db.bgMap == key)
+        SetShown(r.sel, r.selected)
+        if ms then
+            local a, h = ms.wins.Alliance or 0, ms.wins.Horde or 0
+            r.label = key == "ALL" and "All battlegrounds" or key
+            r.name:SetText(r.label)
+            if key == "ALL" then r.name:SetTextColor(1, 0.82, 0) else r.name:SetTextColor(1, 1, 1) end
+            r.matches:SetText(Num(ms.matches))
+            if a + h > 0 then
+                local aw = 120 * a / (a + h)
+                SetShown(r.a, a > 0); SetShown(r.h, h > 0)
+                r.a:SetWidth(math.max(1, aw))
+                r.h:SetWidth(math.max(1, 120 - aw))
+                r.factionText:SetText(Pct(a, a + h) .. " / " .. Pct(h, a + h))
+            else
+                r.a:Hide(); r.h:Hide()
+                r.factionText:SetText("-")
+            end
+            r.record:SetText(string.format("|cff00ff00%d|r - |cffff4040%d|r  %s", ms.myWin, ms.myLoss, Pct(ms.myWin, ms.myWin + ms.myLoss)))
+            -- without team / class / race / level filter every game has a winner and a loser: always about 50 %
+            local filtered = db.bgTeam ~= "ALL" or bgSel.level or bgSel.class or bgSel.race
+            local rate = ms.g > 0 and ms.w / ms.g or 0
+            local cr, cg, cb = RateColor(rate)
+            r.rate:SetText((filtered and ms.g > 0) and string.format("|cff%02x%02x%02x%s|r", cr * 255, cg * 255, cb * 255, Pct(ms.w, ms.g)) or "-")
+            r.tips = {
+                string.format("%s battlegrounds: Alliance won %s, Horde won %s%s", Num(ms.matches), Num(a), Num(h),
+                    (ms.wins.Draw or 0) > 0 and (", " .. Num(ms.wins.Draw) .. " draw(s)") or ""),
+                string.format("You: %d won, %d lost (%s)", ms.myWin, ms.myLoss, Pct(ms.myWin, ms.myWin + ms.myLoss)),
+                string.format("Win rate of the selection: %s of %s player games (%s)", Num(ms.w), Num(ms.g), Pct(ms.w, ms.g)),
+            }
+        end
+    end
+end
+
+local function CycleValue(current, set)
+    local list = { "ALL" }
+    local sorted = {}
+    for k in pairs(set) do sorted[#sorted + 1] = k end
+    table.sort(sorted)
+    for _, k in ipairs(sorted) do list[#list + 1] = k end
+    for i, v in ipairs(list) do
+        if v == current then return list[i % #list + 1] end
+    end
+    return "ALL"
+end
+
+local function CreateBGPanel()
+    local p = CreateFrame("Frame", "ForeverPlayerStatisticsBGPanel", UIParent, "BackdropTemplate")
+    bgPanel = p
+    p:SetSize(W, BG_H)
+    p:SetPoint("CENTER", 40, -20)
+    if p.SetClampedToScreen then p:SetClampedToScreen(true) end
+    p:SetFrameStrata("DIALOG")
+    p:SetMovable(true)
+    p:EnableMouse(true)
+    p:RegisterForDrag("LeftButton")
+    p:SetScript("OnDragStart", p.StartMoving)
+    p:SetScript("OnDragStop", p.StopMovingOrSizing)
+    if p.SetBackdrop then
+        p:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = { left = 8, right = 8, top = 8, bottom = 8 },
+        })
+    end
+    p:Hide()
+    tinsert(UISpecialFrames, "ForeverPlayerStatisticsBGPanel")
+
+    local title = p:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetPoint("TOP", 0, -16)
+    title:SetText("Battleground Statistics")
+    local close = CreateFrame("Button", nil, p, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", -4, -4)
+
+    p.summary = p:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    p.summary:SetPoint("TOPLEFT", 20, -42)
+
+    local function Button(w, x, onClick)
+        local b = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+        b:SetSize(w, 22)
+        b:SetPoint("TOPLEFT", x, -62)
+        b:SetScript("OnClick", onClick)
+        return b
+    end
+    p.mapBtn = Button(170, 18, function()
+        db.bgMap = CycleValue(db.bgMap, p.stats.maps)
+        RefreshBGPanel()
+    end)
+    p.bracketBtn = Button(130, 190, function()
+        db.bgBracket = CycleValue(db.bgBracket, p.stats.brackets)
+        RefreshBGPanel()
+    end)
+    p.teamBtn = Button(120, 322, function()
+        local nextTeam = { ALL = "Alliance", Alliance = "Horde", Horde = "ALL" }
+        db.bgTeam = nextTeam[db.bgTeam] or "ALL"
+        RefreshBGPanel()
+    end)
+    p.clearBtn = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+    p.clearBtn:SetSize(90, 22)
+    p.clearBtn:SetPoint("TOPRIGHT", -18, -62)
+    p.clearBtn:SetText("Show all")
+    p.clearBtn:SetScript("OnClick", function()
+        bgSel.level, bgSel.class, bgSel.race = nil, nil, nil
+        RefreshBGPanel()
+    end)
+
+    -- wins per faction
+    Header(p, "Wins per faction", 20, -96)
+    local fb = CreateFrame("Frame", nil, p)
+    fb:SetSize(INNER_W, 18)
+    fb:SetPoint("TOPLEFT", 20, -114)
+    fb.bg = fb:CreateTexture(nil, "BACKGROUND")
+    fb.bg:SetAllPoints()
+    SetColor(fb.bg, 0, 0, 0, 0.5)
+    fb.a = fb:CreateTexture(nil, "ARTWORK")
+    fb.a:SetPoint("TOPLEFT"); fb.a:SetPoint("BOTTOMLEFT")
+    SetColor(fb.a, FACTION_COLORS.Alliance[1], FACTION_COLORS.Alliance[2], FACTION_COLORS.Alliance[3], 0.85)
+    fb.h = fb:CreateTexture(nil, "ARTWORK")
+    fb.h:SetPoint("TOPRIGHT"); fb.h:SetPoint("BOTTOMRIGHT")
+    SetColor(fb.h, FACTION_COLORS.Horde[1], FACTION_COLORS.Horde[2], FACTION_COLORS.Horde[3], 0.85)
+    fb.text = fb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    fb.text:SetPoint("CENTER")
+    p.factionBar = fb
+    p.record = p:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    p.record:SetPoint("TOPLEFT", 20, -136)
+    p.record:SetWidth(INNER_W)
+    p.record:SetJustifyH("LEFT")
+
+    -- per battleground
+    Header(p, "Battlegrounds", 20, -158)
+    for _, col in ipairs({ { 160, 50, "RIGHT", "games" }, { 222, 120, "CENTER", "Alliance / Horde won" },
+        { 350, 110, "RIGHT", "your record" }, { 470, 90, "RIGHT", "win rate (filter)" } }) do
+        local fs = p:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+        fs:SetPoint("TOPLEFT", col[1], -160)
+        fs:SetSize(col[2], 12)
+        fs:SetJustifyH(col[3])
+        fs:SetText(col[4])
+    end
+    p.mapRows = CreateMapRows(p, -178)
+
+    -- win rate per class and race
+    local listTop = -178 - MAP_ROWS * ROW_H - 14
+    p.classHeader = Header(p, "Win rate per class", 20, listTop)
+    p.raceHeader = Header(p, "Win rate per race", 20 + INNER_W / 2 + 5, listTop)
+    p.classRows = CreateWinRows(p, 20, listTop - 20, function(key)
+        bgSel.class = bgSel.class ~= key and key or nil
+        RefreshBGPanel()
+    end)
+    p.raceRows = CreateWinRows(p, 20 + INNER_W / 2 + 5, listTop - 20, function(key)
+        bgSel.race = bgSel.race ~= key and key or nil
+        RefreshBGPanel()
+    end)
+
+    -- win rate per level
+    local histTop = listTop - 20 - ROWS * ROW_H - 14
+    p.levelHeader = Header(p, "Win rate per level", 20, histTop)
+    local hint = p:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    hint:SetPoint("TOPRIGHT", -20, histTop - 2)
+    hint:SetText("line = 50 %, click a level, class or race to filter")
+    local hist = CreateFrame("Frame", nil, p)
+    hist:SetSize(INNER_W, BG_HIST_H)
+    hist:SetPoint("TOPLEFT", 20, histTop - 20)
+    hist.bg = hist:CreateTexture(nil, "BACKGROUND")
+    hist.bg:SetAllPoints()
+    SetColor(hist.bg, 0, 0, 0, 0.4)
+    hist.mid = hist:CreateTexture(nil, "OVERLAY")
+    hist.mid:SetPoint("LEFT", hist, "BOTTOMLEFT", 0, BG_HIST_H / 2)
+    hist.mid:SetSize(INNER_W, 1)
+    SetColor(hist.mid, 1, 1, 1, 0.5)
+    hist.bars, hist.labels = {}, {}
+    p.hist = hist
+
+    p.note = p:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    p.note:SetPoint("TOPLEFT", hist, "BOTTOMLEFT", 0, -20)
+    p.note:SetWidth(INNER_W)
+    p.note:SetJustifyH("LEFT")
+
+    p.trackCheck = CreateCheck(p, "Record battlegrounds (all players at the end of each battleground)", 14, histTop - 20 - BG_HIST_H - 52,
+        function() return db.bgTrack end,
+        function(v)
+            db.bgTrack = v
+            Print("battleground recording " .. OnOff(v) .. ".")
+            if UpdateBGIcon then UpdateBGIcon() end
+        end)
+
+    StaticPopupDialogs["FOREVERPLAYERSTATISTICS_BGRESET"] = {
+        text = "Delete all %s recorded battlegrounds?",
+        button1 = YES,
+        button2 = NO,
+        OnAccept = function()
+            wipe(bgdb.matches)
+            bgCache = nil
+            Print("battleground data cleared.")
+            RefreshBGPanel()
+            if UpdateBGIcon then UpdateBGIcon() end
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+    local reset = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+    reset:SetSize(150, 22)
+    reset:SetPoint("TOPRIGHT", -20, histTop - 20 - BG_HIST_H - 50)
+    reset:SetText("Reset battlegrounds")
+    reset:SetScript("OnClick", function()
+        StaticPopup_Show("FOREVERPLAYERSTATISTICS_BGRESET", Num(#bgdb.matches))
+    end)
+
+    local help = p:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    help:SetPoint("BOTTOMLEFT", 20, 16)
+    help:SetWidth(INNER_W)
+    help:SetJustifyH("LEFT")
+    help:SetText("Every player of a finished battleground counts as one game: a win if their faction won. Draws are not counted. Levels are not on the scoreboard; they come from the raid, nameplates, target / mouseover or the player database.")
+
+    p:SetScript("OnShow", function() RefreshBGPanel() end)
+end
+
+local function RefreshBGHistogram(s)
+    local hist = bgPanel.hist
+    local n = MaxLevel()
+    for l in pairs(s.level) do if l > n then n = l end end
+    local bw = INNER_W / n
+    for l = 1, n do
+        local b = hist.bars[l]
+        if not b then
+            b = CreateFrame("Frame", nil, hist)
+            b:EnableMouse(true)
+            b.tex = b:CreateTexture(nil, "ARTWORK")
+            b.tex:SetPoint("BOTTOMLEFT")
+            b.tex:SetPoint("BOTTOMRIGHT")
+            b.sel = b:CreateTexture(nil, "BACKGROUND")
+            b.sel:SetAllPoints()
+            SetColor(b.sel, 1, 1, 1, 0.15)
+            b:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:AddLine("Level " .. self.level)
+                if self.e then
+                    GameTooltip:AddLine(string.format("%s of %s games won (%s)", Num(self.e.w), Num(self.e.g), Pct(self.e.w, self.e.g)), 1, 1, 1)
+                else
+                    GameTooltip:AddLine("no games", 0.6, 0.6, 0.6)
+                end
+                GameTooltip:AddLine(bgSel.level == self.level and "Click to show all levels again"
+                    or "Click to show the classes and races of this level", 0.6, 0.6, 0.6)
+                GameTooltip:Show()
+            end)
+            b:SetScript("OnLeave", GameTooltip_Hide)
+            b:SetScript("OnMouseUp", function(self)
+                bgSel.level = bgSel.level ~= self.level and self.level or nil
+                RefreshBGPanel()
+            end)
+            hist.bars[l] = b
+        end
+        b:ClearAllPoints()
+        b:SetPoint("BOTTOMLEFT", hist, "BOTTOMLEFT", (l - 1) * bw, 0)
+        b:SetSize(math.max(1, bw > 3 and bw - 1 or bw), BG_HIST_H)
+        local e = s.level[l]
+        b.level, b.e = l, e
+        SetShown(b.sel, bgSel.level == l)
+        if e and e.g > 0 then
+            local rate = Rate(e)
+            local cr, cg, cb = RateColor(rate)
+            -- few games: paler bar
+            SetColor(b.tex, cr, cg, cb, e.g >= 10 and 0.9 or 0.4)
+            b.tex:SetHeight(math.max(1, BG_HIST_H * rate))
+            b.tex:Show()
+        else
+            b.tex:Hide()
+        end
+        b:Show()
+    end
+    for l = n + 1, #hist.bars do hist.bars[l]:Hide() end
+    local step = n > 80 and 20 or 10
+    local marks = { 1 }
+    for l = step, n, step do marks[#marks + 1] = l end
+    for i, l in ipairs(marks) do
+        local fs = hist.labels[i]
+        if not fs then
+            fs = hist:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+            hist.labels[i] = fs
+        end
+        fs:ClearAllPoints()
+        fs:SetPoint("TOP", hist, "BOTTOMLEFT", (l - 0.5) * bw, -2)
+        fs:SetText(tostring(l))
+        fs:Show()
+    end
+    for i = #marks + 1, #hist.labels do hist.labels[i]:Hide() end
+end
+
+function RefreshBGPanel()
+    local p = bgPanel
+    if not (p and p:IsShown()) then return end
+    p.trackCheck:Refresh()
+    local s = ComputeBGStats()
+    p.stats = s
+    p.summary:SetText(string.format("|cffffd100%s|r battlegrounds recorded   -   |cffffd100%s|r match the filter",
+        Num(#bgdb.matches), Num(s.matches)))
+    p.mapBtn:SetText(db.bgMap == "ALL" and "All battlegrounds" or db.bgMap)
+    p.bracketBtn:SetText("Bracket: " .. (db.bgBracket == "ALL" and "All" or db.bgBracket))
+    p.teamBtn:SetText("Team: " .. FACTION_FILTER_LABEL[db.bgTeam])
+
+    local a, h, d = s.wins.Alliance or 0, s.wins.Horde or 0, s.wins.Draw or 0
+    local fb = p.factionBar
+    if a + h == 0 then
+        fb.a:Hide(); fb.h:Hide()
+        fb.text:SetText("no battlegrounds yet")
+    else
+        local aw = INNER_W * a / (a + h)
+        SetShown(fb.a, a > 0); SetShown(fb.h, h > 0)
+        fb.a:SetWidth(math.max(1, aw))
+        fb.h:SetWidth(math.max(1, INNER_W - aw))
+        fb.text:SetText(string.format("Alliance won %s (%s)        Horde won %s (%s)", Pct(a, a + h), Num(a), Pct(h, a + h), Num(h)))
+    end
+    local record = string.format("Your battlegrounds: |cff00ff00%s won|r, |cffff4040%s lost|r (%s)",
+        Num(s.myWin), Num(s.myLoss), Pct(s.myWin, s.myWin + s.myLoss))
+    if d > 0 then record = record .. string.format("   -   %s draw(s), not counted", Num(d)) end
+    p.record:SetText(record)
+
+    FillMapRows(p.mapRows, s.mapStats)
+    FillWinRows(p.classRows, s.class, ClassLabel, ClassColor, bgSel.class)
+    FillWinRows(p.raceRows, s.race, RaceLabel, RaceColor, bgSel.race)
+    RefreshBGHistogram(s)
+
+    local function Suffix(...)
+        local parts = {}
+        for i = 1, select("#", ...) do
+            local v = select(i, ...)
+            if v then parts[#parts + 1] = v end
+        end
+        return #parts > 0 and ("|cffffffff - " .. table.concat(parts, ", ") .. "|r") or ""
+    end
+    local lvl = bgSel.level and ("level " .. bgSel.level) or nil
+    p.classHeader:SetText("Win rate per class" .. Suffix(lvl, bgSel.race and RaceLabel(bgSel.race)))
+    p.raceHeader:SetText("Win rate per race" .. Suffix(lvl, bgSel.class and ClassLabel(bgSel.class)))
+    p.levelHeader:SetText("Win rate per level" .. Suffix(bgSel.class and ClassLabel(bgSel.class), bgSel.race and RaceLabel(bgSel.race)))
+    SetShown(p.clearBtn, bgSel.level or bgSel.class or bgSel.race)
+    p.note:SetText(string.format("%s player games match the filter, %s of them without known level (left out of the level chart). Pale bars: fewer than 10 games.",
+        Num(s.entries), Num(s.noLevel)))
+end
+
+local function ToggleBGPanel()
+    if not bgPanel then return end
+    if bgPanel:IsShown() then bgPanel:Hide() else bgPanel:Show() end
 end
 
 ---------------------------------------------------------------------------
@@ -1896,10 +2812,15 @@ local function CreateInfoPanel()
         function(v) ForeverPlayerStatistics_SetChatTooltip(v) end)
     checks[4]:ClearAllPoints()
     checks[4]:SetPoint("TOPLEFT", checks[3], "BOTTOMLEFT", 0, -2)
+    checks[5] = CreateCheck(info, "Refresh a player with /who when the mouse is over the name in chat", 12, -10,
+        function() return db.chatRefresh end,
+        function(v) ForeverPlayerStatistics_SetChatRefresh(v) end)
+    checks[5]:ClearAllPoints()
+    checks[5]:SetPoint("TOPLEFT", checks[4], "BOTTOMLEFT", 0, -2)
     info:SetScript("OnShow", function()
         for _, cb in ipairs(checks) do cb:Refresh() end
     end)
-    last = checks[4]
+    last = checks[5]
 
     local open = CreateFrame("Button", nil, info, "UIPanelButtonTemplate")
     open:SetSize(160, 24)
@@ -1919,48 +2840,126 @@ end
 -- Minimap button
 ---------------------------------------------------------------------------
 
-local function CreateMinimapButton()
+-- A round button at the edge of the minimap that can be dragged around it.
+-- angleKey: field in db that holds its position in degrees.
+local function CreateMinimapIcon(name, texture, angleKey)
     -- Keep the button outside the minimap; WoW Forever clips minimap child frames.
-    bar = CreateFrame("Button", "ForeverPlayerStatisticsMinimapButton", UIParent)
-    bar:SetSize(31, 31)
-    bar:SetFrameStrata("MEDIUM")
-    bar:SetFrameLevel(8)
-    bar:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-    bar:RegisterForDrag("LeftButton")
+    local b = CreateFrame("Button", name, UIParent)
+    b:SetSize(31, 31)
+    b:SetFrameStrata("MEDIUM")
+    b:SetFrameLevel(8)
+    b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    b:RegisterForDrag("LeftButton")
 
-    local border = bar:CreateTexture(nil, "OVERLAY")
+    local border = b:CreateTexture(nil, "OVERLAY")
     border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
     border:SetSize(53, 53)
     border:SetPoint("TOPLEFT")
 
-    local icon = bar:CreateTexture(nil, "ARTWORK")
-    icon:SetTexture("Interface\\Icons\\INV_Misc_Spyglass_03")
+    local icon = b:CreateTexture(nil, "ARTWORK")
+    icon:SetTexture(texture)
     icon:SetSize(20, 20)
     icon:SetPoint("TOPLEFT", 6, -5)
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    bar.icon = icon
-    if icon.SetDesaturated then icon:SetDesaturated(not db.enabled) end -- grey while the addon is off
+    b.icon = icon
 
-    bar:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+    b:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
 
     local function UpdatePosition()
-        local angle = math.rad(db.minimapAngle)
+        local angle = math.rad(db[angleKey])
         local radius = (Minimap:GetWidth() / 2) + 5
-        bar:ClearAllPoints()
-        bar:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * radius, math.sin(angle) * radius)
+        b:ClearAllPoints()
+        b:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * radius, math.sin(angle) * radius)
     end
     UpdatePosition()
 
-    bar:SetScript("OnDragStart", function(self)
+    b:SetScript("OnDragStart", function(self)
         self:SetScript("OnUpdate", function()
             local mx, my = Minimap:GetCenter()
             local scale = Minimap:GetEffectiveScale()
             local cx, cy = GetCursorPosition()
-            db.minimapAngle = math.deg(math.atan2(cy / scale - my, cx / scale - mx))
+            db[angleKey] = math.deg(math.atan2(cy / scale - my, cx / scale - mx))
             UpdatePosition()
         end)
     end)
-    bar:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
+    b:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
+    return b
+end
+
+-- Second minimap button: battleground statistics at a glance, click opens the window.
+local bgIcon
+local function ShowBGIconTooltip(self)
+    GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+    GameTooltip:AddLine("Battleground Statistics")
+    local matches = bgdb and bgdb.matches or {}
+    if #matches == 0 then
+        GameTooltip:AddLine("No battlegrounds recorded yet.", 1, 1, 1)
+        GameTooltip:AddLine("Every finished battleground is recorded automatically.", 0.7, 0.7, 0.7)
+    else
+        -- your record overall and per battleground (no player data needed, so this stays fast)
+        local total = { w = 0, l = 0, d = 0 }
+        local maps, mapNames = {}, {}
+        for _, m in ipairs(matches) do
+            local map = m.map or "?"
+            local t = maps[map]
+            if not t then t = { w = 0, l = 0, d = 0 }; maps[map] = t; mapNames[#mapNames + 1] = map end
+            local key = (m.winner == "Draw" and "d") or (m.winner == m.me and "w") or "l"
+            t[key] = t[key] + 1
+            total[key] = total[key] + 1
+        end
+        table.sort(mapNames)
+        local function Line(label, t, r, g, b)
+            GameTooltip:AddDoubleLine(label,
+                string.format("|cff00ff00%d|r - |cffff4040%d|r   %s", t.w, t.l, Pct(t.w, t.w + t.l)), r, g, b, 1, 1, 1)
+        end
+        GameTooltip:AddLine(string.format("%s battlegrounds recorded", Num(#matches)), 1, 1, 1)
+        Line("All battlegrounds", total, 1, 0.82, 0)
+        for _, map in ipairs(mapNames) do Line(map, maps[map], 1, 1, 1) end
+        -- last battleground
+        local last = matches[#matches]
+        local result = last.winner == "Draw" and "draw"
+            or (last.winner == last.me and "|cff00ff00won|r" or "|cffff4040lost|r")
+        GameTooltip:AddLine(string.format("Last: %s, %s (%s)", last.map or "?", result,
+            date("%d.%m. %H:%M", last.time or time())), 0.8, 0.8, 0.8)
+    end
+    if bg.active then
+        GameTooltip:AddLine("|cff00ff00In a battleground:|r it is recorded when it ends.", 1, 1, 1)
+    end
+    if not (db.enabled and db.bgTrack) then
+        GameTooltip:AddLine("Recording |cffff4040off|r (/fps bg on)", 1, 1, 1)
+    end
+    GameTooltip:AddLine("Left-click: battleground statistics", 0.7, 0.7, 0.7)
+    GameTooltip:AddLine("Right-click: player overview", 0.7, 0.7, 0.7)
+    GameTooltip:AddLine("Drag to move around the minimap.", 0.7, 0.7, 0.7)
+    GameTooltip:Show()
+end
+
+local function CreateBGMinimapButton()
+    bgIcon = CreateMinimapIcon("ForeverPlayerStatisticsBGMinimapButton", "Interface\\Icons\\INV_BannerPVP_02", "bgMinimapAngle")
+    if bgIcon.icon.SetDesaturated then bgIcon.icon:SetDesaturated(not (db.enabled and db.bgTrack)) end
+    bgIcon:SetScript("OnClick", function(_, button)
+        if button == "RightButton" then
+            TogglePanel()
+        else
+            ToggleBGPanel()
+        end
+    end)
+    bgIcon:SetScript("OnEnter", ShowBGIconTooltip)
+    bgIcon:SetScript("OnLeave", GameTooltip_Hide)
+    SetShown(bgIcon, db.bgMinimapShown)
+end
+
+-- grey icon while battleground recording is off; tooltip updated after a new match
+function UpdateBGIcon()
+    if not bgIcon then return end
+    if bgIcon.icon.SetDesaturated then bgIcon.icon:SetDesaturated(not (db.enabled and db.bgTrack)) end
+    if GameTooltip:IsOwned(bgIcon) then ShowBGIconTooltip(bgIcon) end
+end
+
+local function CreateMinimapButton()
+    bar = CreateMinimapIcon("ForeverPlayerStatisticsMinimapButton", "Interface\\Icons\\INV_Misc_Spyglass_03", "minimapAngle")
+    local icon = bar.icon
+    if icon.SetDesaturated then icon:SetDesaturated(not db.enabled) end -- grey while the addon is off
 
     local function ShowTooltip(self)
         local s = ComputeStats(true)
@@ -2014,6 +3013,7 @@ ticker:SetScript("OnUpdate", function(_, elapsed)
     tickElapsed = 0
     CheckTimeout()
     UpdateScanUI()
+    BG_Tick()
 end)
 
 local f = CreateFrame("Frame")
@@ -2026,6 +3026,11 @@ f:SetScript("OnEvent", function(_, event, arg1)
         db = ForeverPlayerStatisticsDB
         CopyDefaults(defaults, db)
         LoadPlayers()
+        -- battleground database (separate SavedVariable)
+        ForeverPlayerStatisticsBG = ForeverPlayerStatisticsBG or {}
+        bgdb = ForeverPlayerStatisticsBG
+        bgdb.version = bgdb.version or 1
+        if type(bgdb.matches) ~= "table" then bgdb.matches = {} end
         -- continue the pass that was running before logout / reload
         scan.queue = db.scanQueue
         -- data of the old class / race split scan, no longer used
@@ -2089,13 +3094,22 @@ f:SetScript("OnEvent", function(_, event, arg1)
             hooksecurefunc(C_FriendList, "SendWho", OnAnySendWho)
         end
         CreateMinimapButton()
+        CreateBGMinimapButton()
         CreatePanel()
+        CreateBGPanel()
         CreateInfoPanel()
 
         f:RegisterEvent("WHO_LIST_UPDATE")
         f:RegisterEvent("PLAYER_TARGET_CHANGED")
         f:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
         f:RegisterEvent("PLAYER_REGEN_ENABLED")
+        -- battleground tracker
+        f:RegisterEvent("PLAYER_ENTERING_WORLD")
+        f:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+        f:RegisterEvent("UPDATE_BATTLEFIELD_SCORE")
+        f:RegisterEvent("GROUP_ROSTER_UPDATE")
+        pcall(f.RegisterEvent, f, "NAME_PLATE_UNIT_ADDED")
+        BG_CheckZone()
         CreateAutoTrigger()
 
         Print(string.format("loaded. %s players in the database. Click the minimap spyglass or type /fps for the overview.",
@@ -2115,8 +3129,18 @@ f:SetScript("OnEvent", function(_, event, arg1)
         OnWhoListUpdate()
     elseif event == "PLAYER_TARGET_CHANGED" then
         RecordUnit("target")
+        NoteUnitLevel("target")
     elseif event == "UPDATE_MOUSEOVER_UNIT" then
         RecordUnit("mouseover")
+        NoteUnitLevel("mouseover")
+    elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
+        BG_CheckZone()
+    elseif event == "UPDATE_BATTLEFIELD_SCORE" then
+        BG_OnScore()
+    elseif event == "GROUP_ROSTER_UPDATE" then
+        NoteRosterLevels()
+    elseif event == "NAME_PLATE_UNIT_ADDED" then
+        NoteUnitLevel(arg1)
     end
 end)
 
@@ -2133,6 +3157,7 @@ end
 function ForeverPlayerStatistics_SetEnabled(on)
     db.enabled = on and true or false
     if bar and bar.icon and bar.icon.SetDesaturated then bar.icon:SetDesaturated(not db.enabled) end
+    if UpdateBGIcon then UpdateBGIcon() end
     Print(db.enabled and "switched |cff00ff00on|r." or "switched |cffff4040off|r: nothing is recorded and no /who is sent until you switch it on again.")
     if RefreshPanel then RefreshPanel() end
 end
@@ -2149,6 +3174,10 @@ function ForeverPlayerStatistics_SetWhoPaused(on)
     whoPaused = on and true or false
     Print(whoPaused and "/who search |cffffd100paused until you log out|r." or "/who search |cff00ff00resumed|r.")
     if RefreshPanel then RefreshPanel() end
+end
+
+function ForeverPlayerStatistics_ToggleBG()
+    ToggleBGPanel()
 end
 
 function ForeverPlayerStatistics_Toggle()
@@ -2189,8 +3218,21 @@ SlashCmdList["FOREVERPLAYERSTATISTICS"] = function(msg)
         RefreshPanel()
     elseif cmd == "chat" then
         ForeverPlayerStatistics_SetChatTooltip(not db.chatTooltip)
+    elseif cmd == "bg" and (rest == "on" or rest == "off") then
+        db.bgTrack = rest == "on"
+        Print("battleground recording " .. OnOff(db.bgTrack) .. ".")
+        if RefreshBGPanel then RefreshBGPanel() end
+        UpdateBGIcon()
+    elseif cmd == "bgicon" then
+        db.bgMinimapShown = not db.bgMinimapShown
+        if bgIcon then SetShown(bgIcon, db.bgMinimapShown) end
+        Print("battleground minimap button " .. OnOff(db.bgMinimapShown) .. ".")
+    elseif cmd == "bg" then
+        ToggleBGPanel()
+    elseif cmd == "chatwho" then
+        ForeverPlayerStatistics_SetChatRefresh(not db.chatRefresh)
     elseif cmd == "help" then
-        Print("/fps - overview  |  /fps start - start the scan / send the next query now  |  /fps stop - stop the scan  |  /fps reset - clear the database  |  /fps cooldown <seconds>  |  /fps deep - deep search on/off  |  /fps chat - chat name tooltip on/off  |  /fps on|off - addon on/off  |  /fps who on|off - /who search on/off  |  /fps who pause|resume - pause until logout")
+        Print("/fps - overview  |  /fps start - start the scan / send the next query now  |  /fps stop - stop the scan  |  /fps reset - clear the database  |  /fps cooldown <seconds>  |  /fps deep - deep search on/off  |  /fps chat - chat name tooltip on/off  |  /fps chatwho - /who refresh on hover on/off  |  /fps bg - battleground statistics  |  /fps bg on|off - battleground recording on/off  |  /fps bgicon - battleground minimap button on/off  |  /fps on|off - addon on/off  |  /fps who on|off - /who search on/off  |  /fps who pause|resume - pause until logout")
         Print("Addon: " .. OnOff(db.enabled) .. "   /who search: " .. OnOff(db.whoEnabled))
         Print("Recording targets/mouseover: " .. OnOff(db.recordUnits) .. "   own /who searches: " .. OnOff(db.recordOwnWho))
     elseif panel then
