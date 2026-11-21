@@ -70,6 +70,10 @@ local function OnOff(v)
     return v and "|cff00ff00ON|r" or "|cffff0000OFF|r"
 end
 
+local function EnabledText(v)
+    return v and "|cff00ff00enabled|r" or "|cffff4040disabled|r"
+end
+
 local function SetShown(frame, shown)
     frame:SetShown(shown and true or false)
 end
@@ -1084,8 +1088,28 @@ local function CreateCheck(parent, label, x, y, get, set)
     cb.text = cb:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
     cb.text:SetPoint("LEFT", cb, "RIGHT", 2, 0)
     cb.text:SetText(label)
-    cb:SetScript("OnClick", function(self) set(self:GetChecked() and true or false) end)
     cb.Refresh = function(self) self:SetChecked(get()) end
+    -- mouseover: current state, and what a click does (disable in red)
+    cb.ShowTip = function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine(label, 1, 0.82, 0, true)
+        local on = get() and true or false
+        GameTooltip:AddLine("Currently: " .. (on and "|cff00ff00enabled|r" or "|cffff4040disabled|r"), 1, 1, 1)
+        if on then
+            GameTooltip:AddLine("Click to disable", 1, 0.25, 0.25)
+        else
+            GameTooltip:AddLine("Click to enable", 0.25, 1, 0.25)
+        end
+        GameTooltip:AddLine(self.notSaved and "Only until logout (not saved)" or "Saved permanently", 0.6, 0.6, 0.6)
+        GameTooltip:Show()
+    end
+    cb:SetScript("OnClick", function(self)
+        set(self:GetChecked() and true or false)
+        self:Refresh()
+        if GameTooltip:IsOwned(self) then self:ShowTip() end
+    end)
+    cb:SetScript("OnEnter", function(self) self:ShowTip() end)
+    cb:SetScript("OnLeave", GameTooltip_Hide)
     return cb
 end
 
@@ -1743,6 +1767,7 @@ local function CreatePanel()
     panel.checks[#panel.checks + 1] = CreateCheck(panel, "Pause the /who search until I log out (not saved)", 14, scanTop - 170,
         function() return whoPaused end,
         function(v) ForeverPlayerStatistics_SetWhoPaused(v) end)
+    panel.checks[#panel.checks].notSaved = true
     panel.checks[#panel.checks + 1] = CreateCheck(panel, "Show the stored data when the mouse is over a player name in chat", 14, scanTop - 194,
         function() return db.chatTooltip end,
         function(v) ForeverPlayerStatistics_SetChatTooltip(v) end)
@@ -2577,11 +2602,7 @@ local function CreateBGPanel()
 
     p.trackCheck = CreateCheck(p, "Record battlegrounds (all players at the end of each battleground)", 14, histTop - 20 - BG_HIST_H - 52,
         function() return db.bgTrack end,
-        function(v)
-            db.bgTrack = v
-            Print("battleground recording " .. OnOff(v) .. ".")
-            if UpdateBGIcon then UpdateBGIcon() end
-        end)
+        function(v) ForeverPlayerStatistics_SetBGTrack(v) end)
 
     StaticPopupDialogs["FOREVERPLAYERSTATISTICS_BGRESET"] = {
         text = "Delete all %s recorded battlegrounds?",
@@ -2805,6 +2826,7 @@ local function CreateInfoPanel()
     checks[3] = CreateCheck(info, "Pause the /who search until I log out (not saved)", 12, -10,
         function() return whoPaused end,
         function(v) ForeverPlayerStatistics_SetWhoPaused(v) end)
+    checks[3].notSaved = true
     checks[3]:ClearAllPoints()
     checks[3]:SetPoint("TOPLEFT", checks[2], "BOTTOMLEFT", 0, -2)
     checks[4] = CreateCheck(info, "Show the stored data when the mouse is over a player name in chat", 12, -10,
@@ -2817,10 +2839,20 @@ local function CreateInfoPanel()
         function(v) ForeverPlayerStatistics_SetChatRefresh(v) end)
     checks[5]:ClearAllPoints()
     checks[5]:SetPoint("TOPLEFT", checks[4], "BOTTOMLEFT", 0, -2)
+    checks[6] = CreateCheck(info, "Record battlegrounds (all players at the end of each battleground)", 12, -10,
+        function() return db.bgTrack end,
+        function(v) ForeverPlayerStatistics_SetBGTrack(v) end)
+    checks[6]:ClearAllPoints()
+    checks[6]:SetPoint("TOPLEFT", checks[5], "BOTTOMLEFT", 0, -2)
+    checks[7] = CreateCheck(info, "Show the battleground minimap button", 12, -10,
+        function() return db.bgMinimapShown end,
+        function(v) ForeverPlayerStatistics_SetBGIcon(v) end)
+    checks[7]:ClearAllPoints()
+    checks[7]:SetPoint("TOPLEFT", checks[6], "BOTTOMLEFT", 0, -2)
     info:SetScript("OnShow", function()
         for _, cb in ipairs(checks) do cb:Refresh() end
     end)
-    last = checks[5]
+    last = checks[7]
 
     local open = CreateFrame("Button", nil, info, "UIPanelButtonTemplate")
     open:SetSize(160, 24)
@@ -2891,6 +2923,7 @@ local bgIcon
 local function ShowBGIconTooltip(self)
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
     GameTooltip:AddLine("Battleground Statistics")
+    GameTooltip:AddLine("Part of ForeverPlayerStatistics", 0.6, 0.6, 0.6)
     local matches = bgdb and bgdb.matches or {}
     if #matches == 0 then
         GameTooltip:AddLine("No battlegrounds recorded yet.", 1, 1, 1)
@@ -2925,8 +2958,15 @@ local function ShowBGIconTooltip(self)
     if bg.active then
         GameTooltip:AddLine("|cff00ff00In a battleground:|r it is recorded when it ends.", 1, 1, 1)
     end
-    if not (db.enabled and db.bgTrack) then
-        GameTooltip:AddLine("Recording |cffff4040off|r (/fps bg on)", 1, 1, 1)
+    GameTooltip:AddLine(" ")
+    GameTooltip:AddDoubleLine("ForeverPlayerStatistics", EnabledText(db.enabled), 1, 0.82, 0)
+    GameTooltip:AddDoubleLine("Battleground recording", EnabledText(db.bgTrack), 1, 0.82, 0)
+    if not db.enabled then
+        GameTooltip:AddLine("Nothing is recorded while the addon is disabled (/fps on)", 0.25, 1, 0.25)
+    elseif db.bgTrack then
+        GameTooltip:AddLine("Disable recording: /fps bg off (saved permanently)", 1, 0.25, 0.25)
+    else
+        GameTooltip:AddLine("Enable recording: /fps bg on", 0.25, 1, 0.25)
     end
     GameTooltip:AddLine("Left-click: battleground statistics", 0.7, 0.7, 0.7)
     GameTooltip:AddLine("Right-click: player overview", 0.7, 0.7, 0.7)
@@ -2981,6 +3021,15 @@ local function CreateMinimapButton()
                 db.scanPass or 0, #scan.queue, Num(scan.foundCount)), 1, 1, 1)
         else
             GameTooltip:AddLine("Scan |cffff4040stopped|r", 1, 1, 1)
+        end
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddDoubleLine("ForeverPlayerStatistics", EnabledText(db.enabled), 1, 0.82, 0)
+        GameTooltip:AddDoubleLine("/who search", EnabledText(db.whoEnabled), 1, 0.82, 0)
+        GameTooltip:AddDoubleLine("Battleground recording", EnabledText(db.bgTrack), 1, 0.82, 0)
+        if db.enabled then
+            GameTooltip:AddLine("Disable the addon: /fps off (saved permanently)", 1, 0.25, 0.25)
+        else
+            GameTooltip:AddLine("Enable the addon: /fps on", 0.25, 1, 0.25)
         end
         GameTooltip:AddLine("Left-click: overview", 0.7, 0.7, 0.7)
         GameTooltip:AddLine("Right-click: start the scan / send the next query now", 0.7, 0.7, 0.7)
@@ -3176,6 +3225,21 @@ function ForeverPlayerStatistics_SetWhoPaused(on)
     if RefreshPanel then RefreshPanel() end
 end
 
+-- Battleground recording on / off. Saved permanently in the database.
+function ForeverPlayerStatistics_SetBGTrack(on)
+    db.bgTrack = on and true or false
+    Print("battleground recording " .. OnOff(db.bgTrack) .. " (saved permanently).")
+    if RefreshBGPanel then RefreshBGPanel() end
+    if UpdateBGIcon then UpdateBGIcon() end
+end
+
+-- Battleground minimap button shown / hidden. Saved permanently in the database.
+function ForeverPlayerStatistics_SetBGIcon(on)
+    db.bgMinimapShown = on and true or false
+    if bgIcon then SetShown(bgIcon, db.bgMinimapShown) end
+    Print("battleground minimap button " .. OnOff(db.bgMinimapShown) .. " (saved permanently).")
+end
+
 function ForeverPlayerStatistics_ToggleBG()
     ToggleBGPanel()
 end
@@ -3219,14 +3283,9 @@ SlashCmdList["FOREVERPLAYERSTATISTICS"] = function(msg)
     elseif cmd == "chat" then
         ForeverPlayerStatistics_SetChatTooltip(not db.chatTooltip)
     elseif cmd == "bg" and (rest == "on" or rest == "off") then
-        db.bgTrack = rest == "on"
-        Print("battleground recording " .. OnOff(db.bgTrack) .. ".")
-        if RefreshBGPanel then RefreshBGPanel() end
-        UpdateBGIcon()
+        ForeverPlayerStatistics_SetBGTrack(rest == "on")
     elseif cmd == "bgicon" then
-        db.bgMinimapShown = not db.bgMinimapShown
-        if bgIcon then SetShown(bgIcon, db.bgMinimapShown) end
-        Print("battleground minimap button " .. OnOff(db.bgMinimapShown) .. ".")
+        ForeverPlayerStatistics_SetBGIcon(not db.bgMinimapShown)
     elseif cmd == "bg" then
         ToggleBGPanel()
     elseif cmd == "chatwho" then
