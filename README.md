@@ -31,13 +31,13 @@ Copy the `ForeverPlayerStatistics` folder into `_forever_/Interface/AddOns/` so 
 
 The scan **starts automatically** and runs until you press **Stop** (in the overview, or `/fps stop`). It keeps running after `/reload` and logout.
 
-The game only allows `/who` from a key press or mouse click, so an addon cannot send it on a timer. The addon therefore sends the next query **with your next key press or click in the game world** once the cooldown (5 s) is over. Your keys still work normally; the addon only uses the moment of the key press.
+The game only allows `/who` from a key press or mouse click, so an addon cannot send it on a timer. The addon therefore sends the next query **with your next key press or click in the game world** once the cooldown (7 s) is over. Your keys still work normally; the addon only uses the moment of the key press.
 
 Scan queries run completely in the background: the Who window does not open and nothing is written to the chat. You do not need to open the overview window either. `/who` searches you type yourself work as usual.
 
 How it works:
 
-1. A pass asks **every level once, without any other filter**, from the highest level down to level 1: `60-60`, `59-59`, ... `1-1` (60 queries, about 5 minutes per pass).
+1. A pass asks **every level once, without any other filter**, from the highest level down to level 1: `60-60`, `59-59`, ... `1-1` (60 queries, about 7 minutes per pass).
 2. When level 1 is done, the next pass starts again at the highest level, in a loop until you press Stop.
 3. `/who` returns at most 50 players per query. A level with 50 or more players online is not split further, so some of its players can be missing; the summary after each pass says how many levels hit the limit.
 4. **Deep search** (option in the overview or `/fps deep`, off by default): every level query also gets a random letter, e.g. `23-23 n-"k"`. `/who` then only lists players with that letter in their name, so busy levels with 50+ players show different players in every pass. Quiet levels return fewer players per query, so leave it off if you mainly want complete counts of quiet levels.
@@ -52,7 +52,7 @@ Limits: only players who are online during the scan are found, and `/who` only l
 | `/fps start` | Start the scan / send the next query now |
 | `/fps stop` | Stop the scan |
 | `/fps reset` | Delete the whole database (asks first) |
-| `/fps cooldown <seconds>` | Time between two `/who` queries (default 5) |
+| `/fps cooldown <seconds>` | Time between two `/who` queries (default 7) |
 | `/fps deep` | Deep search on / off |
 | `/fps chat` | Tooltip on player names in chat on / off |
 | `/fps bg` | Battleground statistics (win rate per class, race and level) |
@@ -79,7 +79,7 @@ ForeverPlayerStatistics is built to stay within the rules for addons:
 - **Official addon API only.** It uses the same `/who` function every player can type. It does not change game files, read memory or run any outside program.
 - **No automation of gameplay.** It never moves, fights, loots or interacts for you. It only reads the public `/who` list and the players you target or mouse over.
 - **You stay in control.** The game only allows `/who` on a real key press or mouse click, and the addon follows that: no input from you, no query. It does not work around this protection.
-- **Limited traffic.** At most one `/who` query every 5 seconds (raise it with `/fps cooldown <seconds>`), and never a second one while the first is still waiting for its answer. That is far below what the server allows and has no effect on the server or other players.
+- **Limited traffic.** At most one `/who` query every 7 seconds (raise it with `/fps cooldown <seconds>`), and never a second one while the first is still waiting for its answer. That is far below what the server allows and has no effect on the server or other players.
 - **Your data stays with you.** Everything is saved locally in your SavedVariables. Nothing is sent anywhere or shared with other players.
 - **Easy to switch off.** The `/who` search can be paused until logout or switched off completely (see above).
 

@@ -13,7 +13,7 @@ local defaults = {
     bgMinimapShown = true, -- show the battleground minimap button
     recordOwnWho = true,   -- also store the results of /who searches you type yourself
     recordUnits = true,    -- store players you target or mouse over
-    whoCooldown = 5,       -- seconds between two /who queries of a scan
+    whoCooldown = 7,       -- seconds between two /who queries of a scan
     deepSearch = false,    -- each level query also gets a random name letter (n-"k") to find other players
     autoScan = true,       -- scan keeps running until Stop is pressed
     scanPass = 0,          -- number of scan passes started
@@ -2975,7 +2975,9 @@ local function ShowBGIconTooltip(self)
 end
 
 local function CreateBGMinimapButton()
-    bgIcon = CreateMinimapIcon("ForeverPlayerStatisticsBGMinimapButton", "Interface\\Icons\\INV_BannerPVP_02", "bgMinimapAngle")
+    -- banner of the logged-in character's faction: INV_BannerPVP_01 = Horde, _02 = Alliance
+    local banner = UnitFactionGroup("player") == "Horde" and "INV_BannerPVP_01" or "INV_BannerPVP_02"
+    bgIcon = CreateMinimapIcon("ForeverPlayerStatisticsBGMinimapButton", "Interface\\Icons\\" .. banner, "bgMinimapAngle")
     if bgIcon.icon.SetDesaturated then bgIcon.icon:SetDesaturated(not (db.enabled and db.bgTrack)) end
     bgIcon:SetScript("OnClick", function(_, button)
         if button == "RightButton" then
@@ -3074,6 +3076,12 @@ f:SetScript("OnEvent", function(_, event, arg1)
         ForeverPlayerStatisticsDB = ForeverPlayerStatisticsDB or {}
         db = ForeverPlayerStatisticsDB
         CopyDefaults(defaults, db)
+        -- the default cooldown went from 5 to 7 s (the server sometimes refused queries
+        -- after 5 s); move players who still have the old default, once
+        if not db.cooldownMigrated then
+            if db.whoCooldown == 5 then db.whoCooldown = 7 end
+            db.cooldownMigrated = true
+        end
         LoadPlayers()
         -- battleground database (separate SavedVariable)
         ForeverPlayerStatisticsBG = ForeverPlayerStatisticsBG or {}
